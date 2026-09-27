@@ -19,4 +19,13 @@ int procd_nc_weaken_containment(void) {
     const char *v = getenv("PROCD_NC_WEAKEN");
     return (v && strcmp(v, "1") == 0) ? 1 : 0;
 }
+
+/* When set, the child reports a credential-transition failure to the parent
+ * before running the workload. This lets qualification prove the launch fails
+ * closed and no workload executes when the privilege boundary cannot be
+ * established. */
+int procd_nc_fail_credentials(void) {
+    const char *v = getenv("PROCD_NC_FAIL_CREDS");
+    return (v && strcmp(v, "1") == 0) ? 1 : 0;
+}
 #endif

@@ -196,9 +196,18 @@ typedef struct procd_policy {
     procd_enforcement enforcement;
     /* Optional label for diagnostics; copied by the library. May be NULL. */
     const char *label;
-    /* Drop to this uid/gid before workload execution where the backend
-     * supports a privilege boundary (Linux). -1 means "no change". Ignored by
-     * backends without a privilege model. */
+    /* Drop to this uid/gid before workload execution where the backend supports
+     * a privilege boundary (Linux). Ignored by backends without a privilege
+     * model.
+     *
+     * -1 requests the backend's default. On Linux, "no change" (staying root)
+     * cannot satisfy the ENFORCED privilege-boundary requirement, so -1 selects
+     * a default UNPRIVILEGED identity (nobody, uid/gid 65534) rather than leaving
+     * the workload privileged. An explicit uid/gid of 0 is a deliberately
+     * privileged workload and can never qualify ENFORCED (it is accepted only
+     * under ALLOW_BEST_EFFORT, at a downgraded level). Values that do not round-
+     * trip through the platform uid_t/gid_t are rejected (they could otherwise
+     * narrow to a different, possibly privileged, identity). */
     int64_t drop_uid;
     int64_t drop_gid;
 } procd_policy;

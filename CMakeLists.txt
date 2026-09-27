@@ -90,12 +90,42 @@ target_include_directories(procd-recover-policy-test PRIVATE include)
 add_test(NAME recover_policy COMMAND procd-recover-policy-test)
 set_tests_properties(recover_policy PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
+# Area 1: the workload runs with the intended FINAL credentials (Linux, enforced host)
+add_executable(procd-identity-test tests/identity_test.c)
+target_link_libraries(procd-identity-test PRIVATE procd)
+target_include_directories(procd-identity-test PRIVATE include)
+add_test(NAME identity COMMAND procd-identity-test $<TARGET_FILE:procd-adversary>)
+set_tests_properties(identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+# Area 2: an ordinary inherited writable descriptor is not usable by the workload
+add_executable(procd-fd-inherit-test tests/fd_inherit_test.c)
+target_link_libraries(procd-fd-inherit-test PRIVATE procd)
+target_include_directories(procd-fd-inherit-test PRIVATE include)
+add_test(NAME fd_inherit COMMAND procd-fd-inherit-test $<TARGET_FILE:procd-adversary>)
+set_tests_properties(fd_inherit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+# Area 3: ENFORCED is established per invocation, not inferred; downgrade reports honestly
+add_executable(procd-establish-test tests/establish_test.c)
+target_link_libraries(procd-establish-test PRIVATE procd)
+target_include_directories(procd-establish-test PRIVATE include)
+add_test(NAME establish COMMAND procd-establish-test)
+set_tests_properties(establish PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
 # TEST-ONLY negative-control library variant: production containment can never
 # be weakened; only this variant compiles the weakening switch.
 add_library(procd_nc STATIC ${PROCD_SOURCES} src/negative_control.c)
 target_include_directories(procd_nc PUBLIC include)
 target_link_libraries(procd_nc PUBLIC Threads::Threads)
 target_compile_definitions(procd_nc PUBLIC PROCD_ENABLE_NEGATIVE_CONTROL)
+
+# Area 1: a forced credential-transition failure fails the launch closed and runs
+# no workload, without killing the domain's already-running workloads (Linux).
+# Links the negative-control variant to force the failure deterministically.
+add_executable(procd-cred-fail-test tests/cred_fail_test.c tests/witness.c)
+target_link_libraries(procd-cred-fail-test PRIVATE procd_nc)
+target_include_directories(procd-cred-fail-test PRIVATE include tests)
+add_test(NAME cred_fail COMMAND procd-cred-fail-test $<TARGET_FILE:procd-adversary>)
+set_tests_properties(cred_fail PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 if(APPLE)
   add_executable(procd-macos-escape-test tests/macos_escape_test.c)

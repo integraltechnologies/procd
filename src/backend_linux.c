@@ -22,14 +22,20 @@
  *     verified cgroup2 mount. Editing a token can therefore never redirect a
  *     kill; anything that cannot be verified is UNRESOLVED, never guessed.
  *
- * ENFORCED conditions. discover() reports host/mechanism POTENTIAL; create()
- * independently establishes the invocation-specific boundary and fails closed
- * (REQUIRE_ENFORCED) or honestly downgrades (ALLOW_BEST_EFFORT) if any of these
- * does not actually hold:
+ * ENFORCED conditions. discover() reports cheap host/mechanism POTENTIAL and is
+ * a preflight only; create() independently establishes the invocation-specific
+ * boundary and fails closed (REQUIRE_ENFORCED) or honestly downgrades
+ * (ALLOW_BEST_EFFORT) if any of these does not actually hold. ENFORCED is never
+ * inferred from euid==0 + a cgroup2 mount + cgroup.kill alone:
  *   - /sys/fs/cgroup is a cgroup2 mount and is NOT read-only (B3);
  *   - the kernel exposes cgroup.kill (>= 5.14);
- *   - euid == 0, so procd can create a root-owned protected cgroup and drop the
- *     workload to a distinct unprivileged identity;
+ *   - euid == 0 AND this process actually holds the effective capabilities
+ *     (CAP_SETUID/CAP_SETGID/CAP_SETPCAP) needed to drop the workload's identity
+ *     -- a container root without them cannot, so it is not ENFORCED;
+ *   - procd's OWN cgroup-v2 path is read from the "0::" line of /proc/self/cgroup
+ *     (never a v1 controller line on a hybrid host, which would place the domain
+ *     outside procd's cgroup and make the ancestor check meaningless -- I-1), and
+ *     the invocation cgroup is created as a child of it;
  *   - the invocation cgroup actually exposes writable cgroup.kill / cgroup.procs
  *     and a readable cgroup.events populated flag where they are used (B3);
  *   - the workload identity is exactly representable and is not uid 0 / gid 0 (B1);
@@ -38,14 +44,25 @@
  *     process up and out of the domain (B1);
  *   - the protected recovery record store is usable (safe recovery is part of
  *     the ENFORCED claim);
- * and at spawn time (fail the launch, run no workload, otherwise):
+ * and at spawn time (revalidate prerequisites; fail the launch and run no
+ * workload otherwise):
+ *   - for an ENFORCED domain the controls and the ancestor-safety relationship
+ *     are re-checked, so a domain that became unsafe after create() does not
+ *     launch (I-4);
  *   - every inherited descriptor except stdio and procd's own O_CLOEXEC
  *     exec-status pipe is closed before exec, so the workload cannot act through
  *     a privileged descriptor the caller left open (B2);
- *   - the child completes no_new_privs + capability-bounding-set drop + ambient
- *     clear + KEEPCAPS off + setgroups(0) + setgid + setuid + verification
- *     before exec, and reports any failure to the parent so spawn cannot report
- *     success when the boundary was not established (B1).
+ *   - the child deliberately establishes AND verifies every credential
+ *     transition -- no_new_privs, capability-bounding-set drop, ambient clear,
+ *     KEEPCAPS off, securebits locked, setgroups(0), setresgid, setresuid -- and
+ *     reads back uid/gid (real+effective+saved), supplementary groups and the
+ *     permitted/effective capability sets, reporting any failure to the parent so
+ *     spawn cannot report success when the boundary was not established (B1, I-5).
+ *
+ * Honest reporting: the emptiness proof, the authoritative-population flag and
+ * the crash/recovery behavior are tied to the level actually established, not to
+ * the mere presence of a cgroup2 mount, so a downgraded (BEST_EFFORT) invocation
+ * never claims proven owned-emptiness or durable reacquisition (B-1).
  *
  * ENFORCED does NOT claim protection against same-user execution brokers that a
  * shared drop identity might reach; it establishes cgroup-lifecycle authority,
@@ -65,8 +82,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <linux/capability.h>
 #include <linux/magic.h>
+#include <linux/securebits.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,6 +201,57 @@ static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Extract the cgroup-v2 (unified) path -- the "0::<path>" line -- from a
+ * /proc/<pid>/cgroup file. On a hybrid v1/v2 host such a file has several lines
+ * and only this one describes the unified hierarchy procd operates in; the
+ * leading v1 controller lines describe unrelated hierarchies and their paths
+ * would place (or appear to place) the invocation cgroup outside procd's own
+ * cgroup (I-1). The whole file is read and required to be complete: a truncated
+ * view could name a different cgroup, so it is refused rather than guessed.
+ * Returns 0 on success. */
+static int read_v2_cgroup(const char *proc_path, char *out, size_t n) {
+    int fd = open(proc_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char buf[8192];
+    size_t len = 0;
+    int complete = 0;
+    for (;;) {
+        if (len >= sizeof buf - 1) break; /* overflow: view is not complete */
+        ssize_t r = read(fd, buf + len, sizeof buf - 1 - len);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (r == 0) {
+            complete = 1;
+            break;
+        }
+        len += (size_t)r;
+    }
+    close(fd);
+    if (!complete) return -1; /* a truncated cgroup view is not trustworthy */
+    buf[len] = 0;
+    for (char *line = buf; line && *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        /* the unified hierarchy is the entry with an empty controller list: "0::" */
+        if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+            const char *path = line + 3;
+            if (path[0] != '/') return -1; /* not an absolute cgroup path */
+            size_t pl = strlen(path);
+            if (pl >= n) return -1; /* would truncate: refuse */
+            memcpy(out, path, pl + 1);
+            return 0;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    return -1; /* no unified (cgroup2) hierarchy for this process */
+}
+static int self_v2_cgroup(char *out, size_t n) {
+    return read_v2_cgroup("/proc/self/cgroup", out, n);
 }
 
 /* populated flag from cgroup.events; returns 1 populated, 0 empty, -1 unknown */
@@ -505,6 +576,24 @@ static int cap_last(void) {
     return 40; /* conservative fallback */
 }
 
+/* Can THIS process actually perform the workload privilege drop it will require
+ * at spawn (set*gid/set*uid + capability/securebits locking)? euid 0 is NOT
+ * sufficient: a container root can run with a reduced bounding/effective set and
+ * be unable to drop deliberately. CAP_SETUID(7)/CAP_SETGID(6)/CAP_SETPCAP(8) all
+ * live in the first 32-bit capability word. Used so an ENFORCED claim is never
+ * inferred from euid==0 alone. */
+static int have_effective_caps_for_drop(void) {
+    struct __user_cap_header_struct hdr;
+    struct __user_cap_data_struct data[2];
+    memset(&hdr, 0, sizeof hdr);
+    memset(data, 0, sizeof data);
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    if (syscall(SYS_capget, &hdr, data) != 0) return 0;
+    unsigned needed = (1u << CAP_SETUID) | (1u << CAP_SETGID) | (1u << CAP_SETPCAP);
+    return (data[0].effective & needed) == needed;
+}
+
 /* B2: close every inherited descriptor except stdio and `keep` (the O_CLOEXEC
  * exec-status pipe). Runs in the post-fork/pre-exec child. */
 static void close_inherited(int keep) {
@@ -532,31 +621,83 @@ static void close_inherited(int keep) {
 }
 
 /* B1: establish the full privilege boundary in the child before any workload
- * code. Returns 0 only if every required transition took effect. */
+ * code, deliberately and step by step -- setuid() alone is NOT assumed to be
+ * sufficient. Every required transition is applied AND then read back; the
+ * function returns 0 only if every one is confirmed to have taken effect, so a
+ * silent failure of any step makes spawn() fail closed. Runs post-fork/pre-exec
+ * using async-signal-safe syscalls only. */
 static int child_drop_priv(uid_t u, gid_t g) {
+    /* 1. no_new_privs: no later execve (e.g. of a setuid binary) can regain
+     *    privileges. Set, then confirm. */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+    if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return -1;
+
+    /* 2. Empty the capability bounding set so no capability can ever be acquired. */
     int last = cap_last();
     for (int c = 0; c <= last; c++)
         if (prctl(PR_CAPBSET_DROP, c, 0, 0, 0) != 0 && errno != EINVAL) return -1;
-    prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0); /* so setuid clears permitted/effective caps */
+
+    /* 3. KEEPCAPS off so leaving euid 0 clears permitted/effective caps; clear
+     *    any ambient capabilities that would otherwise survive the uid change. */
+    if (prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0) return -1;
 #ifdef PR_CAP_AMBIENT
-    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 && errno != EINVAL) return -1;
 #endif
-    if (setgroups(0, NULL) != 0) return -1; /* no supplementary-group authority */
-    if (g != 0 && setgid(g) != 0) return -1;
-    if (u != 0 && setuid(u) != 0) return -1;
-#ifdef PR_CAP_AMBIENT
-    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+
+        /* 4. Lock the credential regime with securebits while we still hold
+         *    CAP_SETPCAP (before the uid change). We deliberately do NOT set
+         *    SECBIT_NO_SETUID_FIXUP: the capability clearing on the uid change in
+         *    step 6 is exactly the behavior we rely on. */
+#ifdef PR_SET_SECUREBITS
+    {
+        unsigned long want = SECBIT_KEEP_CAPS_LOCKED;
+#if defined(SECBIT_NO_CAP_AMBIENT_RAISE) && defined(SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED)
+        want |= SECBIT_NO_CAP_AMBIENT_RAISE | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
 #endif
-    /* verify the transition actually happened */
-    if (g != 0 && (getgid() != g || getegid() != g)) return -1;
-    if (u != 0 && (getuid() != u || geteuid() != u)) return -1;
+        if (u != 0) want |= SECBIT_NOROOT | SECBIT_NOROOT_LOCKED; /* dropping off root */
+        if (prctl(PR_SET_SECUREBITS, want, 0, 0, 0) != 0) return -1;
+    }
+#endif
+
+    /* 5. Drop supplementary-group authority. */
+    if (setgroups(0, NULL) != 0) return -1;
+
+    /* 6. Set gid then uid -- real, effective AND saved -- so no set*id back to a
+     *    privileged id is possible. gid before uid, because after the uid change
+     *    we may no longer have the privilege to change gids. */
+    if (g != 0 && setresgid(g, g, g) != 0) return -1;
+    if (u != 0 && setresuid(u, u, u) != 0) return -1;
+
+    /* 7. Verify EVERY transition actually took effect. */
+    if (g != 0) {
+        gid_t rg = 0, eg = 0, sg = 0;
+        if (getresgid(&rg, &eg, &sg) != 0 || rg != g || eg != g || sg != g) return -1;
+    }
+    if (u != 0) {
+        uid_t ru = 0, eu = 0, su = 0;
+        if (getresuid(&ru, &eu, &su) != 0 || ru != u || eu != u || su != u) return -1;
+    }
     int ng = getgroups(0, NULL);
     if (ng > 0) {
         if (ng > 1) return -1;
         gid_t only = 0;
         if (getgroups(1, &only) != 1 || only != g) return -1;
     }
+    /* When we dropped off root, no capability may remain in the permitted or
+     * effective set: that is the whole point of the boundary. */
+    if (u != 0) {
+        struct __user_cap_header_struct hdr;
+        struct __user_cap_data_struct data[2];
+        memset(&hdr, 0, sizeof hdr);
+        memset(data, 0, sizeof data);
+        hdr.version = _LINUX_CAPABILITY_VERSION_3;
+        hdr.pid = 0;
+        if (syscall(SYS_capget, &hdr, data) != 0) return -1;
+        if ((data[0].effective | data[1].effective | data[0].permitted | data[1].permitted) != 0)
+            return -1;
+    }
+    /* no_new_privs must still be set going into execve. */
+    if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return -1;
     return 0;
 }
 
@@ -587,6 +728,12 @@ static procd_capability discover(char *detail, size_t dn) {
                  "root-owned protected hierarchy + privilege drop");
         return PROCD_CAP_BEST_EFFORT;
     }
+    if (!have_effective_caps_for_drop()) {
+        snprintf(detail, dn,
+                 "euid 0 but missing CAP_SETUID/CAP_SETGID/CAP_SETPCAP: cannot establish the "
+                 "workload privilege drop, so ENFORCED is not inferred from euid 0 alone");
+        return PROCD_CAP_BEST_EFFORT;
+    }
     snprintf(detail, dn,
              "cgroup v2 + cgroup.kill + privilege drop: owned work cannot leave the domain via "
              "process topology or cgroup migration by the drop identity; ASSUMES a dedicated drop "
@@ -602,14 +749,24 @@ static void lx_probe(procd_capabilities *out) {
     out->pre_execution_containment = lvl; /* admit-before-exec */
     out->descendant_containment = lvl;
     out->topology_escape_resistance = lvl; /* migration denied by privilege boundary */
-    out->domain_emptiness_proof =
-        cgroup2_mounted() ? PROCD_CAP_ENFORCED : PROCD_CAP_UNSUPPORTED; /* cgroup.events */
+    /* Emptiness proof is a claim about OWNED work, not merely the tracked cgroup
+     * object. cgroup.events proves the cgroup is empty, but that only proves no
+     * owned work remains when the workload could not leave the cgroup -- i.e. at
+     * ENFORCED. Below that, the cgroup-empty fact does not prove owned emptiness,
+     * so the proof level equals the containment level (B-1). */
+    out->domain_emptiness_proof = lvl;
     /* Safe recovery needs the root-protected record store: without it no
      * record can prove a domain existed, so recovery could only be UNRESOLVED. */
     out->safe_recovery = (cgroup2_mounted() && geteuid() == 0 && state_dir_ready(0) == 0)
                              ? PROCD_CAP_ENFORCED
                              : PROCD_CAP_UNSUPPORTED;
-    out->crash_behavior = PROCD_CRASH_DURABLE_REACQUISITION;
+    /* The cgroup survives authority loss, but "durable REACQUISITION" is only
+     * truthful when recovery can authoritatively re-identify it. Without the
+     * protected record store the fate cannot be established after authority
+     * loss, so report that honestly rather than claiming reacquisition. */
+    out->crash_behavior = (out->safe_recovery == PROCD_CAP_ENFORCED)
+                              ? PROCD_CRASH_DURABLE_REACQUISITION
+                              : PROCD_CRASH_UNRESOLVED_ON_AUTHORITY_LOSS;
     out->detail = detail;
 }
 
@@ -621,25 +778,27 @@ static procd_status lx_create(procd_domain *d) {
     if (d->policy.enforcement == PROCD_REQUIRE_ENFORCED && lvl != PROCD_CAP_ENFORCED)
         return PROCD_E_UNSUPPORTED_ENFORCEMENT; /* fail closed; nothing created */
 
+    /* The Linux backend hosts domains in cgroup v2. Without a cgroup2 mount at
+     * CG_ROOT there is no hierarchy to create a domain in: refuse rather than
+     * fabricate a directory on whatever filesystem happens to be mounted there
+     * (e.g. the tmpfs of a v1/hybrid host), which would masquerade as a domain
+     * and then fail confusingly at spawn. This keeps an unusable environment from
+     * yielding a bogus domain even under ALLOW_BEST_EFFORT (area 3). */
+    if (!cgroup2_mounted()) return PROCD_E_PREREQUISITE;
+
     linux_impl *im = calloc(1, sizeof(*im));
     if (!im) return PROCD_E_INTERNAL;
 
     /* Create invocation cgroup under procd's own cgroup so the parent is not
-     * writable by the (soon unprivileged) workload. */
-    char self[512] = {0};
-    if (read_file("/proc/self/cgroup", self, sizeof self) <= 0) {
+     * writable by the (soon unprivileged) workload. The parent MUST be procd's
+     * own cgroup-v2 path: on a hybrid host the first /proc/self/cgroup line is a
+     * v1 controller whose path would place the domain elsewhere (I-1). */
+    char rel_buf[512];
+    if (self_v2_cgroup(rel_buf, sizeof rel_buf) != 0) {
         free(im);
         return PROCD_E_IO;
     }
-    /* /proc/self/cgroup line: "0::/some/path\n" */
-    char *slash = strchr(self, ':');
-    char *rel = strchr(slash ? slash + 1 : self, ':');
-    rel = rel ? rel + 1 : self;
-    for (char *c = rel; *c; ++c)
-        if (*c == '\n') {
-            *c = 0;
-            break;
-        }
+    const char *rel = rel_buf;
 
     if (make_nonce(im->nonce) != 0 || read_boot_id(im->boot_id, sizeof im->boot_id) != 0 ||
         current_view(&im->cgns_ino, &im->cgroot_ino) != 0) {
@@ -746,18 +905,13 @@ static procd_status lx_create(procd_domain *d) {
     return PROCD_OK;
 }
 
-/* verify child landed in exactly our cgroup by reading /proc/<pid>/cgroup */
+/* verify child landed in exactly our cgroup by reading its cgroup-v2 (0::) path.
+ * Uses the same robust parser as create(), so on a hybrid host it compares the
+ * unified path (not a v1 controller line) and refuses a truncated view. */
 static int verify_membership(linux_impl *im, pid_t pid) {
-    char p[64], buf[512];
+    char p[64], rel[512];
     snprintf(p, sizeof p, "/proc/%d/cgroup", (int)pid);
-    if (read_file(p, buf, sizeof buf) <= 0) return 0;
-    char *rel = strrchr(buf, ':');
-    rel = rel ? rel + 1 : buf;
-    for (char *c = rel; *c; ++c)
-        if (*c == '\n') {
-            *c = 0;
-            break;
-        }
+    if (read_v2_cgroup(p, rel, sizeof rel) != 0) return 0;
     return strcmp(rel, im->rel) == 0;
 }
 
@@ -788,6 +942,18 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
     reap_leaders(im, 0); /* opportunistically reap earlier workloads that exited */
     /* revalidate authority still exists */
     if (access(im->path, F_OK) != 0) return PROCD_E_STATE;
+
+    /* Launch invariant: revalidate prerequisites. For an ENFORCED domain confirm
+     * the controls termination/status depend on are still present AND that no
+     * ancestor cgroup became reachable by the workload identity since create()
+     * (I-4). If the domain is no longer safe, refuse and run nothing rather than
+     * launch workload into it. */
+    if (d->runtime_level == PROCD_CAP_ENFORCED) {
+        char why[256];
+        if (!invocation_controls_ok(im->path) ||
+            !hierarchy_safe_for(im->path, im->resolved_uid, im->resolved_gid, why, sizeof why))
+            return PROCD_E_STATE;
+    }
 
     char cgprocs[600];
     join(cgprocs, sizeof cgprocs, im->path, "cgroup.procs");
@@ -847,9 +1013,15 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
 
         /* B1: establish the full privilege boundary before any workload code.
          * TEST-ONLY negative control skips it so the workload stays root and CAN
-         * migrate out of the domain (the harness must observe that escape). */
+         * migrate out of the domain (the harness must observe that escape). A
+         * separate TEST-ONLY knob forces the transition to be reported as failed
+         * so the failure-propagation path (below) can be exercised: the workload
+         * must NOT execute and spawn() must fail. Both compile to 0 in production. */
         if (!procd_nc_weaken_containment()) {
-            if (child_drop_priv(im->resolved_uid, im->resolved_gid) != 0) {
+            int drop_failed = procd_nc_fail_credentials()
+                                  ? -1
+                                  : child_drop_priv(im->resolved_uid, im->resolved_gid);
+            if (drop_failed != 0) {
                 char e = 'P';
                 ssize_t x = write(sync_status[1], &e, 1);
                 (void)x;
@@ -874,7 +1046,9 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
     ssize_t rn = read(sync_admit[0], &b, 1);
     close(sync_admit[0]);
     if (rn != 1 || b != 1) {
-        write(sync_go[1], "\0", 1);
+        /* Admission failed; the child has exited or will on EOF. Do NOT write to
+         * sync_go -- the child may already have closed its read end (SIGPIPE);
+         * closing our end signals EOF to a child still blocked on it. */
         close(sync_go[1]);
         close(sync_status[0]);
         waitpid(pid, NULL, 0);
@@ -883,13 +1057,13 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
 
     /* verify containment: child is in exactly our cgroup */
     if (!verify_membership(im, pid)) {
-        char one[2] = "1";
-        char kp[600];
-        join(kp, sizeof kp, im->path, "cgroup.kill");
-        write_str(kp, one);
-        write(sync_go[1], "\0", 1);
+        /* Deny the go signal by closing our end: the child, still blocked on the
+         * go read, sees EOF and exits WITHOUT execing, leaving the cgroup on its
+         * own. Kill only this child, never the whole domain: a failed spawn must
+         * not terminate workloads already running in the domain (I-2). */
         close(sync_go[1]);
         close(sync_status[0]);
+        kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         return PROCD_E_INTERNAL; /* containment unverified; workload never ran */
     }
@@ -897,13 +1071,11 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
     /* identity already captured at create(); permit execution */
     char go = 1;
     if (write(sync_go[1], &go, 1) != 1) {
-        /* child is blocked on read(go); closing our end gives it EOF -> it exits.
-         * kill the cgroup to be certain nothing was admitted, then reap. */
-        char kp[600];
-        join(kp, sizeof kp, im->path, "cgroup.kill");
-        write_str(kp, "1");
+        /* child is blocked on read(go); closing our end gives it EOF -> it exits
+         * without execing. Kill only this child, not the domain (I-2). */
         close(sync_go[1]);
         close(sync_status[0]);
+        kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         return PROCD_E_IO;
     }
@@ -911,16 +1083,21 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
 
     /* B1: spawn succeeds only if the child established the boundary and exec'd.
      * A byte means the pre-exec privilege transition ('P') or exec ('X') failed;
-     * EOF means execvp succeeded and closed the O_CLOEXEC status pipe. */
+     * EOF (read returns 0) means execvp succeeded and closed the O_CLOEXEC status
+     * pipe. A read ERROR must NOT be treated as success: retry EINTR, and treat
+     * anything other than a clean EOF as failure (I-5). */
     char sb = 0;
-    ssize_t sn = read(sync_status[0], &sb, 1);
+    ssize_t sn;
+    do {
+        sn = read(sync_status[0], &sb, 1);
+    } while (sn < 0 && errno == EINTR);
     close(sync_status[0]);
-    if (sn > 0) {
-        char kp[600];
-        join(kp, sizeof kp, im->path, "cgroup.kill");
-        write_str(kp, "1"); /* nothing owned should remain; be certain */
+    if (sn != 0) {
+        /* The child did not exec (a failure byte, or we could not confirm exec).
+         * Kill only this child; earlier workloads in the domain are untouched. */
+        kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
-        return (sb == 'P') ? PROCD_E_PERMISSION : PROCD_E_IO;
+        return (sn > 0 && sb == 'P') ? PROCD_E_PERMISSION : PROCD_E_IO;
     }
 
     track_leader(im, pid);       /* procd reaps this direct child (terminate/destroy) */
@@ -932,18 +1109,33 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
 static procd_status lx_status(procd_domain *d, procd_domain_status *out) {
     linux_impl *im = d->impl;
     out->process_tree_termination = d->runtime_level;
-    out->population_is_authoritative = 1;
+    /* The cgroup.events populated flag is an authoritative OS mechanism, but it
+     * is only authoritative about OWNED WORK when the workload cannot leave the
+     * cgroup -- i.e. at ENFORCED. Below that the flag is real but says nothing
+     * about work the workload may have placed outside the cgroup, so we do not
+     * mark the population authoritative (B-1). */
+    int authoritative = (d->runtime_level == PROCD_CAP_ENFORCED);
     if (im->removed) {
-        out->state = (d->state == PROCD_STATE_RELEASED) ? PROCD_STATE_RELEASED : PROCD_STATE_EMPTY;
         out->population = PROCD_POP_EMPTY;
+        out->population_is_authoritative = authoritative;
+        /* Only ENFORCED may report EMPTY (owned work proven gone). A downgraded
+         * domain whose cgroup object is gone stays UNRESOLVED as terminate set. */
+        if (d->state == PROCD_STATE_RELEASED)
+            out->state = PROCD_STATE_RELEASED;
+        else if (d->runtime_level == PROCD_CAP_ENFORCED)
+            out->state = PROCD_STATE_EMPTY;
+        else
+            out->state = d->state;
         return PROCD_OK;
     }
     int pop = cg_populated(im->path);
     if (pop < 0) {
         out->population = PROCD_POP_UNKNOWN;
         out->population_is_authoritative = 0;
-    } else
+    } else {
         out->population = pop ? PROCD_POP_POPULATED : PROCD_POP_EMPTY;
+        out->population_is_authoritative = authoritative;
+    }
     out->state = d->state;
     return PROCD_OK;
 }
@@ -1002,21 +1194,37 @@ static procd_status lx_terminate(procd_domain *d, int timeout_ms, procd_terminat
     }
 
     if (pop == 0) {
-        /* Authoritative emptiness is the lifecycle claim; report EMPTY on that
-         * alone. Removal of the cgroup object is a separate, best-effort reclaim
-         * and is recorded as `removed` ONLY if it actually happened. */
-        im->proven_empty = 1;
-        out->emptiness_proven = 1;
-        out->enforced = (d->runtime_level == PROCD_CAP_ENFORCED);
-        out->final_state = PROCD_STATE_EMPTY;
-        d->state = PROCD_STATE_EMPTY;
         reap_leaders(im, 1); /* our direct children are dead now; reap them */
         int gone = (rmdir(im->path) == 0) || (access(im->path, F_OK) != 0);
         im->removed = gone;
-        snprintf(detail, dcap,
-                 "cgroup.kill issued against authority; cgroup.events populated==0 "
-                 "(authoritative); cgroup object %s",
-                 gone ? "removed" : "empty but NOT removed (rmdir failed)");
+        if (d->runtime_level == PROCD_CAP_ENFORCED) {
+            /* ENFORCED: owned work cannot leave the cgroup, so cgroup.events
+             * populated==0 proves NO owned executable work remains. */
+            im->proven_empty = 1;
+            out->emptiness_proven = 1;
+            out->enforced = 1;
+            out->final_state = PROCD_STATE_EMPTY;
+            d->state = PROCD_STATE_EMPTY;
+            snprintf(detail, dcap,
+                     "cgroup.kill issued against authority; cgroup.events populated==0 "
+                     "(authoritative); cgroup object %s",
+                     gone ? "removed" : "empty but NOT removed (rmdir failed)");
+        } else {
+            /* Below ENFORCED: the kernel object drained and was killed, but the
+             * workload could have placed owned work outside the cgroup, so owned
+             * emptiness is NOT proven. Report the cgroup-empty fact honestly and
+             * leave the lifecycle UNRESOLVED rather than claim EMPTY (B-1). */
+            im->proven_empty = 0;
+            out->emptiness_proven = 0;
+            out->enforced = 0;
+            out->final_state = PROCD_STATE_UNRESOLVED;
+            d->state = PROCD_STATE_UNRESOLVED;
+            snprintf(
+                detail, dcap,
+                "best-effort: cgroup.kill issued and cgroup.events populated==0, but owned-work "
+                "emptiness is not proven below ENFORCED; cgroup object %s",
+                gone ? "removed" : "empty but NOT removed (rmdir failed)");
+        }
         return PROCD_OK;
     }
 
