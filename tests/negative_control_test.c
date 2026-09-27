@@ -257,6 +257,20 @@ int main(int argc, char **argv) {
 #elif defined(_WIN32)
 #include <windows.h>
 
+/* Bounded interval we allow for a just-terminated process object to reach the
+ * signaled state after Job termination before ruling on survival (see the
+ * asynchronous-rundown note in run_phase). */
+#define NC_KILL_WAIT_MS 5000
+
+/* Creation time of a process, used to bind a retained handle to the exact
+ * process object the launcher created (PID + creation time), so a later PID
+ * reuse cannot alias it. Matches the launcher's own GetProcessTimes reading. */
+static unsigned long long process_created(HANDLE h) {
+    FILETIME create, exit, kernel, user;
+    if (!h || !GetProcessTimes(h, &create, &exit, &kernel, &user)) return 0;
+    return ((unsigned long long)create.dwHighDateTime << 32) | create.dwLowDateTime;
+}
+
 static DWORD read_pidfile(const char *pf) {
     for (int i = 0; i < 200; i++) {
         FILE *f = fopen(pf, "r");
@@ -271,16 +285,19 @@ static DWORD read_pidfile(const char *pf) {
     return 0;
 }
 
-static int read_outcome(const char *path, DWORD child, int *requested, DWORD *request_error) {
+static int read_outcome(const char *path, DWORD child, int *requested, DWORD *request_error,
+                        unsigned long long *created) {
     for (int i = 0; i < 200; i++) {
         FILE *f = fopen(path, "r");
         if (f) {
             char route[40] = {0};
             unsigned long pid = 0, error = 0;
-            int n = fscanf(f, "%39s %lu %lu", route, &pid, &error);
+            unsigned long long ct = 0;
+            int n = fscanf(f, "%39s %lu %lu %llu", route, &pid, &error, &ct);
             fclose(f);
-            if (n == 3 && pid == child) {
+            if (n == 4 && pid == child) {
                 *request_error = (DWORD)error;
+                *created = ct;
                 if (strcmp(route, "requested-breakaway") == 0)
                     *requested = 1;
                 else if (strcmp(route, "contained-fallback") == 0)
@@ -296,6 +313,15 @@ static int read_outcome(const char *path, DWORD child, int *requested, DWORD *re
 }
 static int proc_alive(HANDLE h) {
     return h && WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+}
+/* Bounded liveness verdict. TerminateJobObject and the Job's active-process
+ * accounting are asynchronous with respect to an individual process object
+ * transitioning to the signaled (terminated) state, so a correct "ceased
+ * execution" oracle waits a bounded interval for the retained handle to become
+ * signaled rather than sampling it once. Returns 1 iff the process is observed
+ * to have exited within timeout ms; a genuine escapee stays unsignaled. */
+static int proc_dead_within(HANDLE h, DWORD timeout) {
+    return h && WaitForSingleObject(h, timeout) == WAIT_OBJECT_0;
 }
 static void kill_process(HANDLE h) {
     if (h) {
@@ -334,18 +360,35 @@ static int run_phase(int weaken, const char *adv, int *requested, char *reason, 
 
     DWORD child = read_pidfile(pidfile);
     DWORD request_error = 0;
-    int outcome_seen = child && read_outcome(outcome_file, child, requested, &request_error);
-    /* Open and retain the exact process object before termination. The verdict
-     * cannot be fooled by later PID reuse. */
-    HANDLE child_process =
-        child ? OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
-                            FALSE, child)
-              : NULL;
+    unsigned long long outcome_created = 0;
+    int outcome_seen =
+        child && read_outcome(outcome_file, child, requested, &request_error, &outcome_created);
+    /* Open and retain the exact process object before termination, and bind the
+     * verdict to the creation time the launcher recorded for it: the retained
+     * handle is a durable identity oracle that later PID reuse cannot fool. */
+    HANDLE child_process = NULL;
+    if (child) {
+        HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                               FALSE, child);
+        if (h && outcome_seen && outcome_created && process_created(h) != outcome_created)
+            CloseHandle(h); /* PID was reused: not the launched process */
+        else
+            child_process = h;
+    }
     int witnessed_alive = proc_alive(child_process);
     Sleep(300);
     procd_termination_evidence ev;
     procd_domain_terminate(d, 8000, &ev);
-    int alive_after = child_process ? proc_alive(child_process) : -1;
+    /* Survival after termination is asynchronous from the test's perspective:
+     * procd_domain_terminate waits for the Job's active-process count to reach
+     * zero, but a contained process object can transition to signaled a moment
+     * later. Measure ACTUAL execution survival with a bounded wait for the
+     * retained handle to become signaled -- never a single instantaneous
+     * sample, which races the OS rundown and would misreport a contained but
+     * still-dying process as alive. An escapee stays unsignaled for the whole
+     * interval, so the discrimination is preserved. */
+    int alive_after = -1;
+    if (child_process) alive_after = proc_dead_within(child_process, NC_KILL_WAIT_MS) ? 0 : 1;
     snprintf(reason, rn,
              "route=%s request_error=%lu child_pid=%lu witnessed_alive_before=%d "
              "emptiness_proven=%d alive_after_kill=%d",

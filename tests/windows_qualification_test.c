@@ -219,7 +219,7 @@ static void case_preexec_handles_unrelated(const char *adv, const char *dir) {
     int64_t spawned = -1;
     const char *argv[] = {adv, "preexec", NULL};
     procd_status spawn_rc = domain ? procd_domain_spawn(domain, argv, &spawned) : PROCD_E_INTERNAL;
-    record root, sent, job_handles;
+    record root = {0}, sent = {0}, job_handles = {0};
     int root_seen = wait_record(dir, "root", &root, 5000);
     int sent_seen = wait_record(dir, "sentinel", &sent, 2000);
     int handles_seen = wait_record(dir, "job-handle-scan", &job_handles, 2000);
@@ -267,7 +267,7 @@ static void case_ordinary(const char *adv, const char *dir) {
     const char *argv[] = {adv, "ordinary", NULL};
     int64_t spawned = -1;
     procd_status rc = domain ? procd_domain_spawn(domain, argv, &spawned) : PROCD_E_INTERNAL;
-    record root, child, grandchild;
+    record root = {0}, child = {0}, grandchild = {0};
     int observed = wait_record(dir, "root", &root, 4000) &&
                    wait_record(dir, "child", &child, 4000) &&
                    wait_record(dir, "grandchild", &grandchild, 4000);
@@ -316,7 +316,7 @@ static void case_churn(const char *adv, const char *dir) {
     procd_domain *domain = new_domain();
     const char *argv[] = {adv, "churn", NULL};
     procd_status rc = domain ? procd_domain_spawn(domain, argv, NULL) : PROCD_E_INTERNAL;
-    record root, members[64];
+    record root = {0}, members[64] = {0};
     int root_seen = wait_record(dir, "root", &root, 4000) && attach_record(&root);
     int n = 0;
     for (int i = 0; i < 200 && n < 8; i++) {
@@ -339,7 +339,7 @@ static void case_churn(const char *adv, const char *dir) {
     int witnessed_total = 0, post_survivors = 0;
     for (int i = 0; i < 256; i++) {
         char role[64];
-        record later;
+        record later = {0};
         snprintf(role, sizeof role, "churn-%04d", i);
         if (!read_record_once(dir, role, &later)) continue;
         witnessed_total++;
@@ -410,7 +410,7 @@ static void case_parent_escape(const char *adv, const char *dir) {
     procd_domain *domain = new_domain();
     const char *argv[] = {adv, "parent-escape", NULL};
     procd_status rc = domain ? procd_domain_spawn(domain, argv, NULL) : PROCD_E_INTERNAL;
-    record request, escaped;
+    record request = {0}, escaped = {0};
     int requested = wait_record(dir, "parent-request-ok", &request, 6000);
     int failed = requested ? 0 : wait_record(dir, "parent-request-failed", &request, 1000);
     int child = requested && read_escape_pid(dir, "parent-escape-pid.txt", &escaped);
@@ -445,7 +445,7 @@ static int duplicate_controller_mode(const char *adv, const char *dir) {
     procd_domain *domain = new_domain();
     const char *argv[] = {adv, "duplicate-job", NULL};
     if (!domain || procd_domain_spawn(domain, argv, NULL) != PROCD_OK) return 3;
-    record result;
+    record result = {0};
     if (!wait_record(dir, "duplicate-ok", &result, 8000) &&
         !wait_record(dir, "duplicate-failed", &result, 500))
         return 4;
@@ -461,7 +461,7 @@ static void case_handle_duplication(const char *self, const char *adv, const cha
     PROCESS_INFORMATION helper;
     int started = spawn_direct(self, args, &helper);
     if (started) CloseHandle(helper.hThread);
-    record root, result;
+    record root = {0}, result = {0};
     int root_seen = wait_record(dir, "root", &root, 6000) && attach_record(&root);
     int dup_ok = wait_record(dir, "duplicate-ok", &result, 6000);
     int dup_failed = dup_ok ? 0 : wait_record(dir, "duplicate-failed", &result, 500);
@@ -505,7 +505,7 @@ static void case_broker(const char *adv, const char *dir) {
     procd_domain *domain = new_domain();
     const char *argv[] = {adv, "broker-wmi", NULL};
     procd_status rc = domain ? procd_domain_spawn(domain, argv, NULL) : PROCD_E_INTERNAL;
-    record escaped, request;
+    record escaped = {0}, request = {0};
     int child = wait_record(dir, "broker-escape", &escaped, 12000) && attach_record(&escaped);
     int requested = wait_record(dir, "broker-request-ok", &request, 1000);
     int request_failed = requested ? 0 : wait_record(dir, "broker-request-failed", &request, 1000);

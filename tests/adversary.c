@@ -248,8 +248,11 @@ static void write_breakaway_outcome(const char *route, const PROCESS_INFORMATION
     if (!path || !path[0]) return;
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "%s %lu %lu\n", route, pi ? (unsigned long)pi->dwProcessId : 0,
-            (unsigned long)requested_error);
+    /* Record the launched process's creation time so the negative control can
+     * bind its retained handle to the exact process object (PID + creation
+     * time), not a bare PID that reuse could alias. */
+    fprintf(f, "%s %lu %lu %llu\n", route, pi ? (unsigned long)pi->dwProcessId : 0,
+            (unsigned long)requested_error, pi ? creation_time(pi->hProcess) : 0ULL);
     fclose(f);
 }
 
