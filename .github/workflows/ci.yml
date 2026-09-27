@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clang-format check
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang-format
+          clang-format --version
+          clang-format --dry-run --Werror \
+            include/*.h src/*.c src/*.h cli/*.c tests/*.c tests/*.h
+      - name: warnings-as-errors build
+        run: |
+          cmake -S . -B build-werror -DCMAKE_C_FLAGS="-Werror"
+          cmake --build build-werror
+
+  # PORTABILITY (native, per OS). Green means: the code builds natively on this
+  # OS and every test either passed or skipped for a stated, genuine reason
+  # (e.g. an unprivileged runner has no cgroup authority, or the backend
+  # truthfully does not claim the guarantee). It is NOT evidence of ENFORCED
+  # ProcessTreeTermination on any platform. No failure is swallowed. Nothing is
+  # cross-compiled; each OS is built and run natively on its own runner.
+  portability:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build --config Release
+      - name: test
+        run: ctest --test-dir build --output-on-failure --no-tests=error -C Release
+
+  # WINDOWS NATIVE QUALIFICATION. Green means the reported BEST_EFFORT model
+  # and its claimed mechanism-level properties were exercised on Windows. It
+  # does not mean ProcessTreeTermination is ENFORCED. Required properties have
+  # no skip path; known escape probes may say INCONCLUSIVE, never PASS, when
+  # stock-runner permissions or services prevent a deterministic reproduction.
+  windows-native-qualification:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure (MSVC warnings are errors)
+        run: cmake -S . -B build-win-qual -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="/WX"
+      - name: build native qualification binaries
+        run: cmake --build build-win-qual --config Release
+      - name: portable contract unit suite
+        shell: pwsh
+        run: |
+          & .\build-win-qual\Release\procd-unit-test.exe 2>&1 | Tee-Object -FilePath windows-unit.log
+          if ($LASTEXITCODE -ne 0) { throw "portable unit suite failed: $LASTEXITCODE" }
+      - name: Windows Job mechanism and limitation qualification
+        shell: pwsh
+        run: |
+          & .\build-win-qual\Release\procd-windows-qualification-test.exe `
+            .\build-win-qual\Release\procd-adversary.exe 2>&1 | `
+            Tee-Object -FilePath windows-qualification.log
+          if ($LASTEXITCODE -ne 0) { throw "Windows native qualification failed: $LASTEXITCODE" }
+          if (-not (Select-String -Path windows-qualification.log -Quiet `
+                  -Pattern "required PASS, .* FAIL")) {
+            throw "qualification summary missing"
+          }
+          if (Select-String -Path windows-qualification.log -Quiet -Pattern "[1-9][0-9]* FAIL") {
+            throw "qualification reported a required failure"
+          }
+      - name: Windows negative control
+        shell: pwsh
+        run: |
+          & .\build-win-qual\Release\procd-negative-control-test.exe `
+            .\build-win-qual\Release\procd-adversary.exe 2>&1 | `
+            Tee-Object -FilePath windows-negative-control.log
+          if ($LASTEXITCODE -ne 0) { throw "Windows negative control failed: $LASTEXITCODE" }
+          if (-not (Select-String -Path windows-negative-control.log -Quiet `
+                  -SimpleMatch "PASS: harness detects breakaway escape; production Job prevents it")) {
+            throw "negative-control production comparison missing"
+          }
+      - name: publish qualification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-qualification-logs
+          path: |
+            windows-unit.log
+            windows-qualification.log
+            windows-negative-control.log
+          if-no-files-found: warn
+
+  # ENFORCED QUALIFICATION (Linux). The only job whose green means Linux
+  # ProcessTreeTermination=ENFORCED was demonstrated. A privileged container with
+  # a private cgroup namespace gives root + cgroup v2 + a non-root namespace-root
+  # cgroup exposing cgroup.kill. Every prerequisite is asserted up front, and
+  # PROCD_REQUIRE_ENFORCED=1 turns any skip (missing prerequisite, unobserved
+  # adversarial precondition, inconclusive negative control) into a failure.
+  linux-enforced-qualification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ENFORCED qualification in privileged container
+        run: |
+          docker run --rm --privileged --cgroupns=private -v "$PWD":/work:ro -w /work gcc:13 \
+            bash -euo pipefail -c '
+            apt-get update -qq && apt-get install -y -qq cmake >/dev/null
+            cmake -S . -B /tmp/build -DCMAKE_BUILD_TYPE=Release
+            cmake --build /tmp/build
+            B=/tmp/build
+
+            echo "--- prerequisites (fail, never skip)"
+            test "$(id -u)" = 0
+            test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+            test -e /sys/fs/cgroup/cgroup.kill
+            $B/procd capabilities | tee /tmp/caps
+            grep -qx "ProcessTreeTermination:     ENFORCED" /tmp/caps
+            grep -qx "SafeRecovery:               ENFORCED" /tmp/caps
+
+            export PROCD_REQUIRE_ENFORCED=1 PROCD_ADV_TTL=10
+
+            echo "--- vacuity guards: a workload that never runs must NOT qualify"
+            if $B/procd qualify --require-enforced /bin/true; then
+              echo "VACUOUS PASS with /bin/true"; exit 1; fi
+            if $B/procd qualify --require-enforced /nonexistent/procd-adversary; then
+              echo "VACUOUS PASS with a non-executable adversary"; exit 1; fi
+
+            echo "--- qualification (every adversarial scenario must PASS)"
+            $B/procd qualify --require-enforced $B/procd-adversary
+            $B/procd-qualify-test $B/procd-adversary
+            echo "--- negative control (weakened escapes, production prevents)"
+            $B/procd-negative-control-test $B/procd-adversary
+            echo "--- recovery"
+            $B/procd-recovery-test
+
+            echo "--- full suite: any skipped test fails this job"
+            ctest --test-dir $B --output-on-failure --no-tests=error | tee /tmp/ctest.log
+            if grep -Eq "Skipped|did not run|Not Run" /tmp/ctest.log; then
+              echo "a test was skipped in the ENFORCED qualification job"; exit 1; fi
+          '

@@ -1,0 +1,7 @@
+/build/
+/build-*/
+*.o
+*.obj
+*.exe
+*.pdb
+/build_*
