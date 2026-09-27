@@ -203,7 +203,8 @@ typedef struct procd_policy {
     int64_t drop_gid;
 } procd_policy;
 
-#define PROCD_POLICY_INIT {PROCD_REQUIRE_ENFORCED, NULL, -1, -1}
+#define PROCD_POLICY_INIT                                                                          \
+    { PROCD_REQUIRE_ENFORCED, NULL, -1, -1 }
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle + population state                                       */

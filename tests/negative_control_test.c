@@ -10,10 +10,11 @@
  * Negative control.
  *
  * For every backend that claims a hard guarantee, we must prove the test
- * harness can OBSERVE the escape it claims to prevent. This test links the
- * TEST-ONLY negative-control library variant (libprocd_nc), which exposes a
- * switch (PROCD_NC_WEAKEN=1) that deliberately weakens the containment
- * boundary.
+ * harness can OBSERVE the escape it claims to prevent. The weakened phase
+ * links the TEST-ONLY negative-control library variant (libprocd_nc), which
+ * exposes a switch (PROCD_NC_WEAKEN=1). On Windows, the production comparison
+ * runs in a fresh helper linked to the real production library, so test-only
+ * process-global state cannot contaminate the comparison.
  *
  *   Phase A (weakened):   run the SAME adversarial strategy against a weakened
  *                         boundary and assert the descendant ESCAPES and
@@ -43,9 +44,7 @@
 #if defined(__linux__) || defined(_WIN32)
 static void set_env(const char *k, const char *v) {
 #if defined(_WIN32)
-    char buf[1024];
-    snprintf(buf, sizeof buf, "%s=%s", k, v ? v : "");
-    _putenv(buf);
+    _putenv_s(k, v ? v : "");
 #else
     if (v)
         setenv(k, v, 1);
@@ -271,6 +270,30 @@ static DWORD read_pidfile(const char *pf) {
     }
     return 0;
 }
+
+static int read_outcome(const char *path, DWORD child, int *requested, DWORD *request_error) {
+    for (int i = 0; i < 200; i++) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char route[40] = {0};
+            unsigned long pid = 0, error = 0;
+            int n = fscanf(f, "%39s %lu %lu", route, &pid, &error);
+            fclose(f);
+            if (n == 3 && pid == child) {
+                *request_error = (DWORD)error;
+                if (strcmp(route, "requested-breakaway") == 0)
+                    *requested = 1;
+                else if (strcmp(route, "contained-fallback") == 0)
+                    *requested = 0;
+                else
+                    *requested = -1;
+                return 1;
+            }
+        }
+        Sleep(10);
+    }
+    return 0;
+}
 static int proc_alive(HANDLE h) {
     return h && WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
 }
@@ -281,15 +304,19 @@ static void kill_process(HANDLE h) {
     }
 }
 
-static int run_phase(int weaken, const char *adv, char *reason, size_t rn) {
+static int run_phase(int weaken, const char *adv, int *requested, char *reason, size_t rn) {
     set_env("PROCD_NC_WEAKEN", weaken ? "1" : NULL);
     set_env("PROCD_ADV_TTL", "15");
     char pf[MAX_PATH];
     GetTempPathA((DWORD)sizeof pf, pf);
     char pidfile[MAX_PATH * 2];
     snprintf(pidfile, sizeof pidfile, "%sprocd_nc_%d.pid", pf, weaken);
+    char outcome_file[MAX_PATH * 2];
+    snprintf(outcome_file, sizeof outcome_file, "%sprocd_nc_%d.outcome", pf, weaken);
     DeleteFileA(pidfile);
+    DeleteFileA(outcome_file);
     set_env("PROCD_ADV_PIDFILE", pidfile);
+    set_env("PROCD_ADV_OUTCOME_FILE", outcome_file);
 
     procd_policy pol = PROCD_POLICY_INIT;
     pol.enforcement = PROCD_ALLOW_BEST_EFFORT;
@@ -306,6 +333,8 @@ static int run_phase(int weaken, const char *adv, char *reason, size_t rn) {
     }
 
     DWORD child = read_pidfile(pidfile);
+    DWORD request_error = 0;
+    int outcome_seen = child && read_outcome(outcome_file, child, requested, &request_error);
     /* Open and retain the exact process object before termination. The verdict
      * cannot be fooled by later PID reuse. */
     HANDLE child_process =
@@ -318,42 +347,83 @@ static int run_phase(int weaken, const char *adv, char *reason, size_t rn) {
     procd_domain_terminate(d, 8000, &ev);
     int alive_after = child_process ? proc_alive(child_process) : -1;
     snprintf(reason, rn,
-             "child_pid=%lu witnessed_alive_before=%d emptiness_proven=%d alive_after_kill=%d",
-             child, witnessed_alive, ev.emptiness_proven, alive_after);
+             "route=%s request_error=%lu child_pid=%lu witnessed_alive_before=%d "
+             "emptiness_proven=%d alive_after_kill=%d",
+             outcome_seen ? (*requested == 1   ? "requested-breakaway"
+                             : *requested == 0 ? "contained-fallback"
+                                               : "creation-failed")
+                          : "unwitnessed",
+             (unsigned long)request_error, child, witnessed_alive, ev.emptiness_proven,
+             alive_after);
     if (child_process) {
         kill_process(child_process);
         CloseHandle(child_process);
     }
     procd_domain_release(d);
     DeleteFileA(pidfile);
-    if (!child || !witnessed_alive) return -1;
+    DeleteFileA(outcome_file);
+    set_env("PROCD_ADV_PIDFILE", NULL);
+    set_env("PROCD_ADV_OUTCOME_FILE", NULL);
+    if (!child || !witnessed_alive || !outcome_seen) return -1;
     return alive_after; /* 1 = escaped/survived, 0 = contained/killed */
+}
+
+#if defined(PROCD_NC_PRODUCTION_HELPER)
+int main(int argc, char **argv) {
+    const char *adv = (argc > 1) ? argv[1] : "procd-adversary.exe";
+    char reason[256];
+    int requested = -1;
+    int result = run_phase(0, adv, &requested, reason, sizeof reason);
+    printf("production helper (linked to production procd): %s -> %s\n", reason,
+           result == 0 && requested == 0 ? "contained fallback observed (expected)" : "FAIL");
+    return result == 0 && requested == 0 ? 0 : 1;
+}
+#else
+static int run_production_helper(const char *helper, const char *adv) {
+    char cmd[MAX_PATH * 4];
+    snprintf(cmd, sizeof cmd, "\"%s\" \"%s\"", helper, adv);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof si);
+    ZeroMemory(&pi, sizeof pi);
+    si.cb = sizeof si;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return -1;
+    CloseHandle(pi.hThread);
+    DWORD wait = WaitForSingleObject(pi.hProcess, 30000);
+    DWORD code = 1;
+    if (wait == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    if (wait == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    return wait == WAIT_OBJECT_0 && code == 0 ? 0 : -1;
 }
 
 int main(int argc, char **argv) {
     const char *adv = (argc > 1) ? argv[1] : "procd-adversary.exe";
-    char ra[160], rb[160];
-    int a = run_phase(1, adv, ra, sizeof ra); /* weakened breakaway: expect survive */
-    int b = run_phase(0, adv, rb, sizeof rb); /* production: expect killed */
-    printf("weakened  : %s -> %s\n", ra,
-           a == 1   ? "ESCAPE OBSERVED (expected)"
-           : a == 0 ? "no escape"
-                    : "INCONCLUSIVE");
-    printf("production: %s -> %s\n", rb,
-           b == 0   ? "contained (expected)"
-           : b == 1 ? "ESCAPE!"
-                    : "INCONCLUSIVE");
-    if (a != 1) {
+    const char *production_helper = (argc > 2) ? argv[2] : NULL;
+    char ra[256];
+    int requested = -1;
+    int a = run_phase(1, adv, &requested, ra, sizeof ra); /* weakened: expect escape */
+    int production_ok = production_helper ? run_production_helper(production_helper, adv) : -1;
+    const char *weakened_result = "INCONCLUSIVE";
+    if (a == 1 && requested == 1)
+        weakened_result = "ESCAPE OBSERVED (expected)";
+    else if (a == 0)
+        weakened_result = "no escape";
+    printf("weakened  : %s -> %s\n", ra, weakened_result);
+    printf("production: separately executed production-linked helper -> %s\n",
+           production_ok == 0 ? "contained (expected)" : "FAIL/INCONCLUSIVE");
+    if (a != 1 || requested != 1) {
         printf("FAIL: harness could not observe breakaway escape under weakened Job\n");
         return 1;
     }
-    if (b != 0) {
-        printf("FAIL: production Job allowed breakaway escape\n");
+    if (production_ok != 0) {
+        printf("FAIL: production-linked helper did not demonstrate contained fallback\n");
         return 1;
     }
     printf("PASS: harness detects breakaway escape; production Job prevents it\n");
     return 0;
 }
+#endif
 
 /* ================= macOS / other ================= */
 #else

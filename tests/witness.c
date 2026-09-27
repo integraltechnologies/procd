@@ -193,4 +193,6 @@ int w_live(const w_rec *r) {
 #endif
     return 1;
 }
+#else
+typedef int procd_witness_translation_unit_nonempty;
 #endif

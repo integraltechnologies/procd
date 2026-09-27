@@ -242,6 +242,17 @@ static void check_sentinel(void) {
     win_witness("sentinel", 0, signalled ? 1 : GetLastError());
 }
 
+static void write_breakaway_outcome(const char *route, const PROCESS_INFORMATION *pi,
+                                    DWORD requested_error) {
+    const char *path = getenv("PROCD_ADV_OUTCOME_FILE");
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s %lu %lu\n", route, pi ? (unsigned long)pi->dwProcessId : 0,
+            (unsigned long)requested_error);
+    fclose(f);
+}
+
 static DWORD request_wmi_broker(void) {
     const char *dir = witness_dir();
     if (!dir) return ERROR_PATH_NOT_FOUND;
@@ -513,11 +524,18 @@ int main(int argc, char **argv) {
      * create fails and we fall back to an in-Job child (which stays contained). */
     if (strcmp(mode, "breakaway") == 0) {
         if (spawn_self("leaf", NULL, CREATE_BREAKAWAY_FROM_JOB, NULL, &pi)) {
+            write_breakaway_outcome("requested-breakaway", &pi, ERROR_SUCCESS);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-        } else if (spawn_self("leaf", NULL, 0, NULL, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+        } else {
+            DWORD requested_error = GetLastError();
+            if (spawn_self("leaf", NULL, 0, NULL, &pi)) {
+                write_breakaway_outcome("contained-fallback", &pi, requested_error);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            } else {
+                write_breakaway_outcome("creation-failed", NULL, requested_error);
+            }
         }
     } else if (strcmp(mode, "preexec") == 0) {
         /* The root witness is intentionally the first fixture action. */

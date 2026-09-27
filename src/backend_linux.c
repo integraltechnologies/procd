@@ -1198,4 +1198,6 @@ const struct procd_backend *procd_active_backend(void) {
     return &BACKEND;
 }
 
+#else
+typedef int procd_backend_linux_translation_unit_nonempty;
 #endif /* __linux__ */

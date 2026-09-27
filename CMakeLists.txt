@@ -127,6 +127,21 @@ endif()
 add_executable(procd-negative-control-test tests/negative_control_test.c tests/witness.c)
 target_link_libraries(procd-negative-control-test PRIVATE procd_nc)
 target_include_directories(procd-negative-control-test PRIVATE include tests)
-add_test(NAME negative_control
-         COMMAND procd-negative-control-test $<TARGET_FILE:procd-adversary>)
+if(WIN32)
+  # The production comparison is a separate process linked to the production
+  # library. It cannot inherit the test-only weakening implementation/state.
+  add_executable(procd-negative-control-production-test
+                 tests/negative_control_test.c tests/witness.c)
+  target_link_libraries(procd-negative-control-production-test PRIVATE procd)
+  target_include_directories(procd-negative-control-production-test PRIVATE include tests)
+  target_compile_definitions(procd-negative-control-production-test
+                             PRIVATE PROCD_NC_PRODUCTION_HELPER)
+  add_test(NAME negative_control
+           COMMAND procd-negative-control-test
+                   $<TARGET_FILE:procd-adversary>
+                   $<TARGET_FILE:procd-negative-control-production-test>)
+else()
+  add_test(NAME negative_control
+           COMMAND procd-negative-control-test $<TARGET_FILE:procd-adversary>)
+endif()
 set_tests_properties(negative_control PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)

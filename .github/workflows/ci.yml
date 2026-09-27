@@ -77,7 +77,8 @@ jobs:
         shell: pwsh
         run: |
           & .\build-win-qual\Release\procd-negative-control-test.exe `
-            .\build-win-qual\Release\procd-adversary.exe 2>&1 | `
+            .\build-win-qual\Release\procd-adversary.exe `
+            .\build-win-qual\Release\procd-negative-control-production-test.exe 2>&1 | `
             Tee-Object -FilePath windows-negative-control.log
           if ($LASTEXITCODE -ne 0) { throw "Windows negative control failed: $LASTEXITCODE" }
           if (-not (Select-String -Path windows-negative-control.log -Quiet `
