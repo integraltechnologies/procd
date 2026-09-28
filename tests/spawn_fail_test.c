@@ -13,7 +13,12 @@
  *
  * Independent oracle: the first workload's witness record (pid + start time),
  * the domain's own population, and the absence of any witness from the failed
- * spawn.
+ * spawns.
+ *
+ * Exec failures carry a precise status: a missing program is
+ * PROCD_E_NOT_FOUND and an existing non-executable file is PROCD_E_PERMISSION
+ * (as on macOS and Windows), and a later ordinary spawn in the same domain
+ * still runs.
  *
  * SPDX-License-Identifier: MPL-2.0
  */
@@ -24,6 +29,7 @@
 
 #if defined(__linux__)
 #include "witness.h"
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,11 +87,28 @@ int main(int argc, char **argv) {
     CHECK(r && r->pid == (long)root && w_find(w, n, "grandchild"),
           "first workload's tree witnessed (root + grandchild)");
 
-    /* second spawn fails at exec */
+    /* failing spawns: a missing program, a bare name not on PATH, and an
+     * existing file without execute permission */
     const char *missing[] = {"/nonexistent/procd-no-such-program", NULL};
     int64_t pid2 = -1;
     procd_status rc = procd_domain_spawn(d, missing, &pid2);
-    CHECK(rc != PROCD_OK && pid2 == -1, "spawn of a missing program fails and reports no pid");
+    CHECK(rc == PROCD_E_NOT_FOUND && pid2 == -1,
+          "spawn of a missing program is NOT_FOUND and reports no pid");
+    const char *unlisted[] = {"procd-no-such-program-on-path", NULL};
+    pid2 = -1;
+    rc = procd_domain_spawn(d, unlisted, &pid2);
+    CHECK(rc == PROCD_E_NOT_FOUND && pid2 == -1, "spawn of a name not on PATH is NOT_FOUND");
+    char noexec[128];
+    snprintf(noexec, sizeof noexec, "%s/.not-executable", wd);
+    FILE *f = fopen(noexec, "w");
+    if (f) fputs("#!/bin/sh\nexit 0\n", f), fclose(f);
+    chmod(noexec, 0644);
+    const char *nx[] = {noexec, NULL};
+    pid2 = -1;
+    rc = procd_domain_spawn(d, nx, &pid2);
+    CHECK(rc == PROCD_E_PERMISSION && pid2 == -1,
+          "spawn of a non-executable file is PERMISSION and reports no pid");
+    unlink(noexec);
     nap(200);
 
     int n2 = w_read(wd, w, W_MAX);
@@ -98,6 +121,24 @@ int main(int argc, char **argv) {
     procd_domain_status_get(d, &st);
     CHECK(st.state == PROCD_STATE_ACTIVE && st.population == PROCD_POP_POPULATED,
           "domain still ACTIVE and populated");
+
+    /* the domain still accepts and runs an ordinary spawn */
+    const char *again[] = {adv, "child", NULL};
+    int64_t pid3 = -1;
+    CHECK(procd_domain_spawn(d, again, &pid3) == PROCD_OK && pid3 > 0,
+          "a spawn after the failures succeeds");
+    for (int i = 0; i < 150; i++) {
+        n2 = w_read(wd, w, W_MAX);
+        int seen = 0;
+        for (int k = 0; k < n2; k++)
+            seen |= !strcmp(w[k].role, "root") && w[k].pid == (long)pid3;
+        if (seen) break;
+        nap(20);
+    }
+    int seen3 = 0;
+    for (int k = 0; k < n2; k++)
+        seen3 |= !strcmp(w[k].role, "root") && w[k].pid == (long)pid3 && w_alive(&w[k]);
+    CHECK(seen3, "the later spawn actually ran (witnessed alive)");
 
     /* the domain still terminates normally afterwards */
     procd_termination_evidence ev;

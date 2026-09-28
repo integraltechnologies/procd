@@ -3,8 +3,13 @@
  * SPDX-License-Identifier: MPL-2.0
  */
 #include "procd.h"
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* internal domain object, only to verify label ownership (no public accessor) */
+#include "../src/backend.h"
 
 static int fails = 0;
 #define CHECK(cond, msg)                                                                           \
@@ -84,6 +89,44 @@ int main(void) {
     } else {
         printf("note: best-effort create returned %s (acceptable on this host)\n",
                procd_status_name(rc));
+    }
+
+    /* Label ownership: procd_create_domain copies policy.label, so the caller's
+     * buffer may be overwritten and freed as soon as creation returns. */
+    {
+        const char *orig = "unit-test-label";
+        char *buf = malloc(64);
+        if (buf) {
+            strcpy(buf, orig);
+            procd_policy lp = PROCD_POLICY_INIT;
+            lp.enforcement = PROCD_ALLOW_BEST_EFFORT;
+            lp.label = buf;
+            procd_domain *ld = NULL;
+            rc = procd_create_domain(&lp, &ld);
+            if (rc == PROCD_OK) {
+                uintptr_t caller = (uintptr_t)buf;
+                memset(buf, 'X', 63);
+                buf[63] = 0;
+                free(buf);
+                CHECK(ld->policy.label && (uintptr_t)ld->policy.label != caller,
+                      "label: domain holds its own copy, not the caller's pointer");
+                CHECK(ld->policy.label && strcmp(ld->policy.label, orig) == 0,
+                      "label: copy unaffected by the caller mutating and freeing its buffer");
+                procd_domain_status lst;
+                CHECK(procd_domain_status_get(ld, &lst) == PROCD_OK, "label: domain usable");
+                CHECK(procd_domain_release(ld) == PROCD_OK, "label: release frees the copy");
+            } else {
+                free(buf);
+                printf("note: label check skipped: create returned %s\n", procd_status_name(rc));
+            }
+        }
+        procd_policy np = PROCD_POLICY_INIT; /* NULL label stays valid */
+        np.enforcement = PROCD_ALLOW_BEST_EFFORT;
+        procd_domain *nd = NULL;
+        if (procd_create_domain(&np, &nd) == PROCD_OK) {
+            CHECK(nd->policy.label == NULL, "label: NULL label accepted");
+            procd_domain_release(nd);
+        }
     }
 
 #if defined(_WIN32)

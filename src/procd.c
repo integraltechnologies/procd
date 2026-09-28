@@ -32,6 +32,18 @@ procd_status procd_create_domain(const procd_policy *policy, procd_domain **out_
 
     procd_domain *d = calloc(1, sizeof(*d));
     if (!d) return PROCD_E_INTERNAL;
+    /* The label is copied: the domain owns it until release, so the caller's
+     * buffer may be reused or freed as soon as this call returns. */
+    if (p.label) {
+        size_t n = strlen(p.label) + 1;
+        char *copy = malloc(n);
+        if (!copy) {
+            free(d);
+            return PROCD_E_INTERNAL;
+        }
+        memcpy(copy, p.label, n);
+        p.label = copy;
+    }
     d->backend = procd_active_backend();
     d->policy = p;
     d->state = PROCD_STATE_CREATED;
@@ -41,6 +53,7 @@ procd_status procd_create_domain(const procd_policy *policy, procd_domain **out_
      * REQUIRE_ENFORCED even if the caller never called probe(). */
     procd_status rc = d->backend->create(d);
     if (rc != PROCD_OK) {
+        free((char *)d->policy.label);
         free(d);
         return rc;
     }
@@ -112,6 +125,7 @@ procd_status procd_domain_release(procd_domain *d) {
     d->state = PROCD_STATE_RELEASED;
     procd_lock_release(&d->lock);
     procd_lock_fini(&d->lock);
+    free((char *)d->policy.label); /* owned copy (NULL for none/recovered handles) */
     free(d);
     return PROCD_OK;
 }

@@ -83,8 +83,6 @@
 
 extern char **environ;
 
-#define MAC_MAX_LEADERS 64
-
 /* A process generation: pid plus kernel start time. */
 typedef struct {
     pid_t pid;
@@ -97,9 +95,12 @@ typedef struct {
 } mac_set;
 
 typedef struct mac_impl {
-    char marker[64];                  /* "PROCD_DOMAIN_<hex>=1" */
-    mac_gen leaders[MAC_MAX_LEADERS]; /* procd's own children, one group each */
-    int nleaders;
+    char marker[64]; /* "PROCD_DOMAIN_<hex>=1" */
+    /* procd's own direct children (one process group each) that may still hold
+     * their pid: running, or exited and not yet reaped. An entry is dropped as
+     * soon as its child is reaped (by procd, or by the embedding program), so
+     * the set holds only live bookkeeping and spawns are not limited. */
+    mac_set leaders;
     mac_set known;  /* running member generations observed so far */
     mac_set others; /* running generations confirmed NOT to carry the marker */
     char detail[384];
@@ -142,6 +143,11 @@ static int set_add(mac_set *s, const mac_gen *g) {
     }
     s->v[s->n++] = *g;
     return 1;
+}
+
+/* remove element i (order is not preserved) */
+static void set_del(mac_set *s, int i) {
+    s->v[i] = s->v[--s->n];
 }
 
 static void mac_probe(procd_capabilities *out) {
@@ -281,9 +287,8 @@ static int scan(mac_impl *im, mac_gen **out) {
             q->member = 1;
             continue;
         }
-        for (int l = 0; l < im->nleaders && !q->member; l++)
-            if (im->leaders[l].pid > 0 && q->pgid == im->leaders[l].pid &&
-                gen_holds(&im->leaders[l]))
+        for (int l = 0; l < im->leaders.n && !q->member; l++)
+            if (q->pgid == im->leaders.v[l].pid && gen_holds(&im->leaders.v[l]))
                 q->member = 1; /* the leader's generation still holds the group id */
         if (q->member || weak || q->uid != me || !buf) continue;
         if (set_has(&im->others, &q->g)) {
@@ -332,13 +337,26 @@ static int scan(mac_impl *im, mac_gen **out) {
     return m;
 }
 
-/* reap procd's own direct children (the leaders) that have exited */
+/* A leader's state: 0 running, 1 exited but unreaped (still holds its pid and
+ * group id), -1 no longer holds its pid (already reaped, possibly by the
+ * embedding program; the pid may now belong to an unrelated process). */
+static int leader_state(const mac_gen *g) {
+    mac_gen now;
+    int z = 0;
+    if (kproc(g->pid, &now, &z) != 0 || !gen_eq(&now, g)) return -1;
+    return z ? 1 : 0;
+}
+
+/* Reap procd's own direct children that have exited and forget leaders that
+ * no longer hold their pid. waitpid is only called on a pid whose exact
+ * generation is still our unreaped child, never on a reused pid. Caller holds
+ * im->mu. */
 static void mac_reap(mac_impl *im) {
-    for (int i = 0; i < im->nleaders; i++) {
-        pid_t pid = im->leaders[i].pid;
-        if (pid <= 0) continue;
-        pid_t r = waitpid(pid, NULL, WNOHANG);
-        if (r == pid || (r < 0 && errno == ECHILD)) im->leaders[i].pid = 0;
+    for (int i = im->leaders.n - 1; i >= 0; i--) {
+        mac_gen *g = &im->leaders.v[i];
+        int st = leader_state(g);
+        if (st < 0 || (st == 1 && waitpid(g->pid, NULL, WNOHANG) == g->pid))
+            set_del(&im->leaders, i);
     }
 }
 
@@ -586,7 +604,6 @@ static procd_status mac_create(procd_domain *d) {
 
 static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t *out_pid) {
     mac_impl *im = d->impl;
-    if (im->nleaders >= MAC_MAX_LEADERS) return PROCD_E_STATE;
 
     /* child environment = ours + the domain marker, built before fork */
     size_t ne = 0;
@@ -653,7 +670,13 @@ static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t 
         return PROCD_E_INTERNAL;
     }
     pthread_mutex_lock(&im->mu);
-    im->leaders[im->nleaders++] = g;
+    if (set_add(&im->leaders, &g) < 0) {
+        pthread_mutex_unlock(&im->mu);
+        close(go[1]); /* EOF: the child exits without running anything */
+        close(st[0]);
+        waitpid(pid, NULL, 0);
+        return PROCD_E_INTERNAL;
+    }
     set_add(&im->known, &g);
     track(im, &g, 1); /* before the workload runs: every fork of the leader is seen */
     pthread_mutex_unlock(&im->mu);
@@ -670,10 +693,16 @@ static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t 
          * everything else in the domain keeps running */
         waitpid(pid, NULL, 0);
         pthread_mutex_lock(&im->mu);
-        im->nleaders--;
+        for (int i = 0; i < im->leaders.n; i++)
+            if (gen_eq(&im->leaders.v[i], &g)) {
+                set_del(&im->leaders, i);
+                break;
+            }
         pthread_mutex_unlock(&im->mu);
+        /* r == sizeof err: the child reported exec's errno; anything else is
+         * a lost handshake */
         return (r == (ssize_t)sizeof err && (err == ENOENT || err == ENOTDIR)) ? PROCD_E_NOT_FOUND
-               : (r == (ssize_t)sizeof err && err == EACCES)                   ? PROCD_E_PERMISSION
+               : (r == (ssize_t)sizeof err && (err == EACCES || err == EPERM)) ? PROCD_E_PERMISSION
                                                                                : PROCD_E_IO;
     }
     if (out_pid) *out_pid = pid;
@@ -691,20 +720,24 @@ static procd_status mac_status(procd_domain *d, procd_domain_status *out) {
      * whose environment the kernel hides (Apple platform binaries such as
      * /bin/sleep). A leader that exits during the scan is reaped next time. */
     pthread_mutex_lock(&im->mu);
-    int exited[MAC_MAX_LEADERS];
-    for (int i = 0; i < im->nleaders; i++) {
-        mac_gen now;
-        int z = 0;
-        exited[i] = im->leaders[i].pid > 0 && kproc(im->leaders[i].pid, &now, &z) == 0 && z &&
-                    gen_eq(&now, &im->leaders[i]);
+    mac_set exited = {0};
+    for (int i = im->leaders.n - 1; i >= 0; i--) {
+        int st = leader_state(&im->leaders.v[i]);
+        if (st < 0)
+            set_del(&im->leaders, i); /* reaped elsewhere: holds nothing any more */
+        else if (st == 1 && set_add(&exited, &im->leaders.v[i]) < 0)
+            break; /* allocation failure: reap these on a later call */
     }
     mac_gen *m = NULL;
     int live = scan(im, &m);
     track(im, m, live);
-    for (int i = 0; i < im->nleaders; i++)
-        if (exited[i] && waitpid(im->leaders[i].pid, NULL, WNOHANG) == im->leaders[i].pid)
-            im->leaders[i].pid = 0;
+    for (int i = im->leaders.n - 1; i >= 0; i--) {
+        mac_gen *g = &im->leaders.v[i];
+        if (set_has(&exited, g) && waitpid(g->pid, NULL, WNOHANG) == g->pid)
+            set_del(&im->leaders, i);
+    }
     pthread_mutex_unlock(&im->mu);
+    free(exited.v);
     free(m);
     out->population = live < 0 ? PROCD_POP_UNKNOWN : live ? PROCD_POP_POPULATED : PROCD_POP_EMPTY;
     out->state = d->state;
@@ -825,6 +858,7 @@ static void mac_destroy(procd_domain *d) {
         free(im->watched.v);
         pthread_mutex_destroy(&im->mu);
         mac_reap(im);
+        free(im->leaders.v);
         free(im->known.v);
         free(im->others.v);
         free(im);

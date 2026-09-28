@@ -125,6 +125,14 @@ if(APPLE)
            COMMAND procd-macos-tracking-test $<TARGET_FILE:procd-adversary>)
   set_tests_properties(macos_tracking PROPERTIES TIMEOUT 120)
 
+  # Spawn count: hundreds of spawns in one domain (no fixed per-domain limit),
+  # exec-failure status codes, concurrent live spawns, no retained zombies.
+  add_executable(procd-macos-spawn-test tests/macos_spawn_test.c tests/witness.c)
+  target_link_libraries(procd-macos-spawn-test PRIVATE procd)
+  target_include_directories(procd-macos-spawn-test PRIVATE include tests)
+  add_test(NAME macos_spawn COMMAND procd-macos-spawn-test $<TARGET_FILE:procd-adversary>)
+  set_tests_properties(macos_spawn PROPERTIES TIMEOUT 180)
+
   # Known residual (env cleared + new session + double fork before any scan):
   # measured with witnessed topology; escapes reported, casualties fail.
   add_executable(procd-macos-residual-test tests/macos_residual_test.c tests/witness.c)

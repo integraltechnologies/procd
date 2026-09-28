@@ -176,8 +176,8 @@ typedef struct procd_capabilities {
 
     procd_crash_behavior crash_behavior;
 
-    /* Stable backend identifier, e.g. "linux-cgroup2", "windows-job",
-     * "macos-none". NUL-terminated, owned by the library, valid for process
+    /* Stable backend identifier: "linux-cgroup2", "windows-job" or
+     * "macos-tracked". NUL-terminated, owned by the library, valid for process
      * lifetime. */
     const char *backend;
     /* Human-readable, one-line note on why levels are what they are on this
@@ -210,7 +210,8 @@ typedef enum procd_enforcement {
 
 typedef struct procd_policy {
     procd_enforcement enforcement;
-    /* Optional label for diagnostics; copied by the library. May be NULL. */
+    /* Optional label for diagnostics. May be NULL. procd_create_domain copies
+     * it; the caller's string need not outlive the call. */
     const char *label;
     /* Optional run-as identity for spawned workloads (Linux; ignored by
      * backends without a uid/gid model). -1 (the default) keeps the caller's

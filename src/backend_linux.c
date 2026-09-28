@@ -830,8 +830,12 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
             _exit(126);
         }
         execvp(argv[0], (char *const *)argv);
-        char e = 'X';
-        ssize_t x = write(status[1], &e, 1);
+        /* exec failed: report 'X' plus exec's errno in one atomic pipe write */
+        int en = errno;
+        char msg[1 + sizeof en];
+        msg[0] = 'X';
+        memcpy(msg + 1, &en, sizeof en);
+        ssize_t x = write(status[1], msg, sizeof msg);
         (void)x;
         _exit(127);
     }
@@ -864,16 +868,30 @@ static procd_status lx_spawn(procd_domain *d, const char *const *argv, int64_t *
     }
     close(go[0]);
 
-    char sb = 0;
-    ssize_t sn;
-    do {
-        sn = read(status[0], &sb, 1);
-    } while (sn < 0 && errno == EINTR);
+    /* Status channel (close-on-exec in the child): EOF with no data = exec
+     * succeeded; 'P' = the run-as identity could not be established; 'X' +
+     * errno = exec failed; anything else = a lost handshake. */
+    char msg[1 + sizeof(int)];
+    size_t got = 0;
+    for (;;) {
+        ssize_t sn = read(status[0], msg + got, sizeof msg - got);
+        if (sn < 0 && errno == EINTR) continue;
+        if (sn <= 0) break;
+        got += (size_t)sn;
+        if (got == sizeof msg) break;
+    }
     close(status[0]);
-    if (sn != 0) {
+    if (got != 0) {
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
-        return (sn > 0 && sb == 'P') ? PROCD_E_PERMISSION : PROCD_E_IO;
+        if (msg[0] == 'P') return PROCD_E_PERMISSION;
+        if (msg[0] == 'X' && got == sizeof msg) {
+            int en;
+            memcpy(&en, msg + 1, sizeof en);
+            if (en == ENOENT || en == ENOTDIR) return PROCD_E_NOT_FOUND;
+            if (en == EACCES || en == EPERM) return PROCD_E_PERMISSION;
+        }
+        return PROCD_E_IO;
     }
 
     track_leader(im, pid);

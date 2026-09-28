@@ -117,10 +117,12 @@ static void set_env(const char *k, const char *v) {
 
 /* ---------------- process table ---------------- */
 
+#define PROC_NAME_LEN 64 /* process names, and the identity labels copied from them */
+
 typedef struct {
     long pid, ppid;
     unsigned long long start;
-    char name[64];
+    char name[PROC_NAME_LEN];
     char exe[512];
 } proc_t;
 
@@ -247,7 +249,7 @@ static int name_is(const char *name, const char *want) {
 
 typedef struct {
     w_rec r[MAXID];
-    char what[MAXID][48];
+    char what[MAXID][PROC_NAME_LEN]; /* a role or a proc_t name: always fits */
     int n;
 } idset;
 

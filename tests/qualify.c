@@ -619,9 +619,11 @@ static void spawn_failure(q_case *c, const char *adv) {
     int still = precondition("grandchild", (long)x.pid, w, n, why, sizeof why);
     outcome o;
     run_finish(&x, TERM_TIMEOUT_MS, &o);
-    if (brc == PROCD_OK) {
+    if (brc != PROCD_E_NOT_FOUND || bp != -1) {
         c->result = Q_FAIL;
-        snprintf(c->detail, sizeof c->detail, "spawn of a nonexistent program reported OK");
+        snprintf(c->detail, sizeof c->detail,
+                 "spawn of a nonexistent program returned %s (pid %lld), not NOT_FOUND",
+                 procd_status_name(brc), (long long)bp);
     } else if (!still || alive != n) {
         c->result = Q_FAIL;
         snprintf(c->detail, sizeof c->detail,
