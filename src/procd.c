@@ -14,9 +14,6 @@
 int procd_nc_weaken_containment(void) {
     return 0;
 }
-int procd_nc_fail_credentials(void) {
-    return 0;
-}
 #endif
 
 procd_status procd_capabilities_probe(procd_capabilities *out) {

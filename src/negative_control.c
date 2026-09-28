@@ -4,10 +4,11 @@
  * library uses the no-op in procd.c that always returns 0, so production
  * containment can never be weakened.
  *
- * When active, the boundary is weakened iff the environment variable
- * PROCD_NC_WEAKEN=1 is set. This lets qualification prove the harness can
- * OBSERVE the escape it claims to prevent: same adversarial strategy, weakened
- * vs. production boundary.
+ * When active, supervision is weakened iff the environment variable
+ * PROCD_NC_WEAKEN=1 is set, so qualification can show the harness observes the
+ * failure the production mechanism prevents: on Linux, process-group
+ * termination instead of the cgroup (an ordinary setsid/double-fork descendant
+ * survives); on Windows, a Job that permits breakaway.
  *
  * SPDX-License-Identifier: MPL-2.0
  */
@@ -17,15 +18,6 @@
 
 int procd_nc_weaken_containment(void) {
     const char *v = getenv("PROCD_NC_WEAKEN");
-    return (v && strcmp(v, "1") == 0) ? 1 : 0;
-}
-
-/* When set, the child reports a credential-transition failure to the parent
- * before running the workload. This lets qualification prove the launch fails
- * closed and no workload executes when the privilege boundary cannot be
- * established. */
-int procd_nc_fail_credentials(void) {
-    const char *v = getenv("PROCD_NC_FAIL_CREDS");
     return (v && strcmp(v, "1") == 0) ? 1 : 0;
 }
 #endif

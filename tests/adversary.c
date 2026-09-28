@@ -431,32 +431,10 @@ static int run_posix(const char *mode) {
             nap_ms(5);
         }
         return 0;
-    } else if (strcmp(mode, "migrate") == 0) {
-        /* Linux negative-control probe: try to escape by writing our pid into a
-         * foreign cgroup. Succeeds only if the boundary is weakened (workload
-         * left privileged). Done in a child so the root stays put. The child
-         * witnesses the OUTCOME of its attempt. */
-        const char *esc = getenv("PROCD_ADV_ESCAPE_CGROUP");
-        if (fork() == 0) {
-            if (!esc || !esc[0]) live("migrate-noenv");
-            char path[600];
-            snprintf(path, sizeof path, "%s/cgroup.procs", esc);
-            int ok = 0;
-            int fd = open(path, O_WRONLY);
-            if (fd >= 0) {
-                char me[16];
-                snprintf(me, sizeof me, "%d", (int)getpid());
-                ok = write(fd, me, strlen(me)) == (ssize_t)strlen(me);
-                close(fd);
-            }
-            live(ok ? "migrate-ok" : "migrate-denied");
-        }
-    } else if (strcmp(mode, "fdescape") == 0) {
-        /* B2 probe: write our pid through a descriptor the CONTROLLER left open
-         * (PROCD_ADV_ESCAPE_FD). Succeeds only if procd let that fd survive exec.
-         * We do not open anything ourselves; the authority, if any, is entirely
-         * in the inherited descriptor. */
-        const char *fs = getenv("PROCD_ADV_ESCAPE_FD");
+    } else if (strcmp(mode, "fdwrite") == 0) {
+        /* Descriptor-leak probe: write through a descriptor the caller left open
+         * (PROCD_ADV_WRITE_FD). Succeeds only if that fd survived into the task. */
+        const char *fs = getenv("PROCD_ADV_WRITE_FD");
         int fd = (fs && fs[0]) ? atoi(fs) : -1;
         if (fork() == 0) {
             int ok = 0;

@@ -62,70 +62,48 @@ target_include_directories(procd-recovery-test PRIVATE include)
 add_test(NAME recovery COMMAND procd-recovery-test)
 set_tests_properties(recovery PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
-# B1/B3: privilege-identity + prerequisite honesty (Linux, needs enforced host)
-add_executable(procd-enforce-prereq-test tests/enforce_prereq_test.c)
-target_link_libraries(procd-enforce-prereq-test PRIVATE procd)
-target_include_directories(procd-enforce-prereq-test PRIVATE include)
-add_test(NAME enforce_prereq COMMAND procd-enforce-prereq-test)
-set_tests_properties(enforce_prereq PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-
-# B2: inherited-descriptor escape (Linux, needs enforced host)
-add_executable(procd-fd-escape-test tests/fd_escape_test.c)
-target_link_libraries(procd-fd-escape-test PRIVATE procd)
-target_include_directories(procd-fd-escape-test PRIVATE include)
-add_test(NAME fd_escape COMMAND procd-fd-escape-test $<TARGET_FILE:procd-adversary>)
-set_tests_properties(fd_escape PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-
-# Cleanup pass: spawn-vs-terminate concurrency (Linux, needs enforced host)
+# Spawn-vs-terminate concurrency on one handle (Linux)
 add_executable(procd-race-test tests/race_test.c)
 target_link_libraries(procd-race-test PRIVATE procd)
 target_include_directories(procd-race-test PRIVATE include)
 add_test(NAME race COMMAND procd-race-test $<TARGET_FILE:procd-adversary>)
 set_tests_properties(race PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 
-# Cleanup pass: recovery preserves spawn security policy (Linux, needs enforced host)
-add_executable(procd-recover-policy-test tests/recover_policy_test.c)
-target_link_libraries(procd-recover-policy-test PRIVATE procd)
-target_include_directories(procd-recover-policy-test PRIVATE include)
-add_test(NAME recover_policy COMMAND procd-recover-policy-test)
-set_tests_properties(recover_policy PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-
-# Area 1: the workload runs with the intended FINAL credentials (Linux, enforced host)
+# Workload identity: caller's credentials by default, optional explicit run-as (Linux)
 add_executable(procd-identity-test tests/identity_test.c)
 target_link_libraries(procd-identity-test PRIVATE procd)
 target_include_directories(procd-identity-test PRIVATE include)
 add_test(NAME identity COMMAND procd-identity-test $<TARGET_FILE:procd-adversary>)
 set_tests_properties(identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
-# Area 2: an ordinary inherited writable descriptor is not usable by the workload
-add_executable(procd-fd-inherit-test tests/fd_inherit_test.c)
+# Descriptor hygiene: a caller descriptor does not leak into the task (Linux)
+add_executable(procd-fd-inherit-test tests/fd_inherit_test.c tests/witness.c)
 target_link_libraries(procd-fd-inherit-test PRIVATE procd)
-target_include_directories(procd-fd-inherit-test PRIVATE include)
+target_include_directories(procd-fd-inherit-test PRIVATE include tests)
 add_test(NAME fd_inherit COMMAND procd-fd-inherit-test $<TARGET_FILE:procd-adversary>)
 set_tests_properties(fd_inherit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
-# Area 3: ENFORCED is established per invocation, not inferred; downgrade reports honestly
+# Establishment: ENFORCED follows the actual cgroup-v2 domain, incl. an unprivileged
+# delegated caller; unusable environments are refused; downgrades report honestly (Linux)
 add_executable(procd-establish-test tests/establish_test.c)
 target_link_libraries(procd-establish-test PRIVATE procd)
 target_include_directories(procd-establish-test PRIVATE include)
 add_test(NAME establish COMMAND procd-establish-test)
 set_tests_properties(establish PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
-# TEST-ONLY negative-control library variant: production containment can never
+# Failed-spawn isolation: a failed spawn never kills running workloads (Linux)
+add_executable(procd-spawn-fail-test tests/spawn_fail_test.c tests/witness.c)
+target_link_libraries(procd-spawn-fail-test PRIVATE procd)
+target_include_directories(procd-spawn-fail-test PRIVATE include tests)
+add_test(NAME spawn_fail COMMAND procd-spawn-fail-test $<TARGET_FILE:procd-adversary>)
+set_tests_properties(spawn_fail PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+# TEST-ONLY negative-control library variant: production supervision can never
 # be weakened; only this variant compiles the weakening switch.
 add_library(procd_nc STATIC ${PROCD_SOURCES} src/negative_control.c)
 target_include_directories(procd_nc PUBLIC include)
 target_link_libraries(procd_nc PUBLIC Threads::Threads)
 target_compile_definitions(procd_nc PUBLIC PROCD_ENABLE_NEGATIVE_CONTROL)
-
-# Area 1: a forced credential-transition failure fails the launch closed and runs
-# no workload, without killing the domain's already-running workloads (Linux).
-# Links the negative-control variant to force the failure deterministically.
-add_executable(procd-cred-fail-test tests/cred_fail_test.c tests/witness.c)
-target_link_libraries(procd-cred-fail-test PRIVATE procd_nc)
-target_include_directories(procd-cred-fail-test PRIVATE include tests)
-add_test(NAME cred_fail COMMAND procd-cred-fail-test $<TARGET_FILE:procd-adversary>)
-set_tests_properties(cred_fail PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 if(APPLE)
   add_executable(procd-macos-escape-test tests/macos_escape_test.c)

@@ -4,20 +4,22 @@
 #endif
 #endif
 /*
- * Honest capability establishment regression (Linux, enforced host).
+ * Lifecycle-domain establishment regression (Linux; root is needed only to SET
+ * UP each environment, the checks themselves run in child processes).
  *
- * Area 3: ENFORCED must be ESTABLISHED per invocation, never inferred from
- * euid==0 + a cgroup2 mount + cgroup.kill. Each case mutates one prerequisite in
- * a child process (its own mount namespace or capability set, so the parent and
- * other tests are unaffected) and asserts procd is conservative:
+ * ENFORCED depends on whether procd can actually create and operate a cgroup-v2
+ * domain, not on who the caller is:
  *
- *   A. read-only cgroup hierarchy  -> capabilities not ENFORCED, and a
- *      REQUIRE_ENFORCED create is refused (fails closed).
- *   B. euid 0 but no CAP_SETUID    -> capabilities not ENFORCED (the privilege
- *      drop cannot be established), and REQUIRE_ENFORCED is refused.
- *   C. a DOWNGRADED (best-effort) invocation reports honestly: its status
- *      population is not authoritative, and terminating it never claims proven
- *      emptiness or a final EMPTY state (B-1).
+ *   A. read-only cgroup hierarchy -> not ENFORCED; REQUIRE_ENFORCED is refused
+ *      and ALLOW_BEST_EFFORT creates nothing (no fabricated domain).
+ *   B. unprivileged caller WITHOUT a delegated subtree (its cgroup is
+ *      root-owned) -> not ENFORCED; both modes create nothing.
+ *   C. unprivileged caller WITH a delegated subtree (directory and cgroup.procs
+ *      chowned to it, as systemd delegation does) -> ENFORCED: the workload is
+ *      spawned with the caller's own uid, a double-forked setsid descendant is
+ *      grouped with it, and termination proves emptiness with no survivor.
+ *   D. a recovered handle whose domain controls are no longer usable (read-only
+ *      mount) is reported below ENFORCED and never claims proven emptiness.
  *
  * SPDX-License-Identifier: MPL-2.0
  */
@@ -28,13 +30,17 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
-#include <linux/capability.h>
+#include <grp.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+#define UNPRIV 65533
 
 static int fails = 0;
 #define CHECK(cond, msg)                                                                           \
@@ -46,103 +52,208 @@ static int fails = 0;
             printf("ok: %s\n", msg);                                                               \
     } while (0)
 
-/* Results a child scenario reports back to the parent. -1 = not attempted. */
+/* Results a child scenario reports back. -1 = not reached. */
 typedef struct {
-    int setup_ok;    /* the environment mutation succeeded */
-    int ptt;         /* capabilities.process_tree_termination */
-    int emptiness;   /* capabilities.domain_emptiness_proof */
-    int req_rc;      /* status of a REQUIRE_ENFORCED create */
-    int be_ok;       /* best-effort create succeeded */
-    int be_level;    /* runtime level of the best-effort domain */
-    int pop_auth;    /* status.population_is_authoritative on the be domain */
-    int empt_proven; /* terminate evidence.emptiness_proven */
-    int final;       /* terminate evidence.final_state */
-    int enforced;    /* terminate evidence.enforced */
+    int setup_ok;
+    int ptt;        /* capabilities.process_tree_termination */
+    int req_rc;     /* REQUIRE_ENFORCED create status */
+    int allow_rc;   /* ALLOW_BEST_EFFORT create status */
+    int level;      /* runtime level of the created / recovered domain */
+    int spawn_rc;   /* spawn status */
+    int uid_ok;     /* workload ran with the caller's uid */
+    int grouped;    /* the setsid'd grandchild was in the domain */
+    int pop_auth;   /* status.population_is_authoritative */
+    int proven;     /* terminate evidence.emptiness_proven */
+    int final;      /* terminate evidence.final_state */
+    int survivors;  /* processes of the workload alive after terminate */
+    int recover_rc; /* recovery outcome */
 } scen;
 
+static void nap(int ms) {
+    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
+    nanosleep(&t, NULL);
+}
+static int write_str(const char *p, const char *s) {
+    int fd = open(p, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t w = write(fd, s, strlen(s));
+    close(fd);
+    return w < 0 ? -1 : 0;
+}
+/* absolute path of this process's cgroup-v2 cgroup (the "0::" line) */
+static void own_cgroup(char *out, size_t n) {
+    char b[4096] = {0};
+    int fd = open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
+    ssize_t r = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;
+    if (fd >= 0) close(fd);
+    b[r > 0 ? r : 0] = 0;
+    const char *rel = "/";
+    for (char *line = strtok(b, "\n"); line; line = strtok(NULL, "\n"))
+        if (strncmp(line, "0::", 3) == 0) rel = line + 3;
+    snprintf(out, n, "/sys/fs/cgroup%s", strcmp(rel, "/") == 0 ? "" : rel);
+}
 static int make_cgroup_readonly(void) {
     if (unshare(CLONE_NEWNS) != 0) return 0;
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 0;
-    /* per-mount read-only via bind-remount, so we do not touch the shared
-     * cgroup2 superblock (which would affect the parent). */
-    if (mount(NULL, "/sys/fs/cgroup", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) {
-        if (mount(NULL, "/sys/fs/cgroup", "cgroup2", MS_REMOUNT | MS_RDONLY, NULL) != 0) return 0;
-    }
+    /* per-mount read-only bind remount: the parent's view is unaffected */
+    if (mount("/sys/fs/cgroup", "/sys/fs/cgroup", NULL, MS_BIND, NULL) != 0) return 0;
+    if (mount(NULL, "/sys/fs/cgroup", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) return 0;
     struct statvfs v;
-    if (statvfs("/sys/fs/cgroup", &v) != 0) return 0;
-    return (v.f_flag & ST_RDONLY) ? 1 : 0;
+    return statvfs("/sys/fs/cgroup", &v) == 0 && (v.f_flag & ST_RDONLY);
+}
+/* move into cgroup dir `cg` (if given) and become UNPRIV with no groups */
+static int become_unprivileged(const char *cg) {
+    if (cg) {
+        char procs[700], me[16];
+        snprintf(procs, sizeof procs, "%s/cgroup.procs", cg);
+        snprintf(me, sizeof me, "%d", (int)getpid());
+        if (write_str(procs, me) != 0) return 0;
+    }
+    return setgroups(0, NULL) == 0 && setresgid(UNPRIV, UNPRIV, UNPRIV) == 0 &&
+           setresuid(UNPRIV, UNPRIV, UNPRIV) == 0 && geteuid() == UNPRIV;
+}
+/* executing (exists and is not a zombie awaiting its reaper) */
+static int executing(long pid) {
+    char p[64], b[512];
+    snprintf(p, sizeof p, "/proc/%ld/stat", pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    ssize_t r = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (r <= 0) return 0;
+    b[r] = 0;
+    char *e = strrchr(b, ')');
+    return e && e[1] == ' ' && e[2] != 'Z' && e[2] != 'X';
+}
+static long uid_of(pid_t pid) {
+    char p[64], b[2048];
+    snprintf(p, sizeof p, "/proc/%d/status", (int)pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    ssize_t r = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (r <= 0) return -1;
+    b[r] = 0;
+    char *u = strstr(b, "\nUid:");
+    return u ? strtol(u + 5, NULL, 10) : -1;
 }
 
-static int drop_cap_setuid(void) {
-    struct __user_cap_header_struct hdr;
-    struct __user_cap_data_struct data[2];
-    memset(&hdr, 0, sizeof hdr);
-    memset(data, 0, sizeof data);
-    hdr.version = _LINUX_CAPABILITY_VERSION_3;
-    if (syscall(SYS_capget, &hdr, data) != 0) return 0;
-    data[0].effective &= ~(1u << CAP_SETUID);
-    data[0].permitted &= ~(1u << CAP_SETUID); /* also drop permitted: cannot be re-raised */
-    if (syscall(SYS_capset, &hdr, data) != 0) return 0;
-    return 1;
+/* Probe + create in both modes; releases anything created. */
+static void probe_and_create(scen *s) {
+    procd_capabilities c;
+    procd_capabilities_probe(&c);
+    s->ptt = (int)c.process_tree_termination;
+    procd_policy p = PROCD_POLICY_INIT;
+    procd_domain *d = NULL;
+    s->req_rc = (int)procd_create_domain(&p, &d);
+    if (d) procd_domain_release(d);
+    p.enforcement = PROCD_ALLOW_BEST_EFFORT;
+    d = NULL;
+    s->allow_rc = (int)procd_create_domain(&p, &d);
+    if (d) procd_domain_release(d);
 }
 
-/* Run one scenario in a child and collect its results. which: 0=readonly, 1=caps. */
-static int run_scenario(int which, scen *out) {
+/* C: full lifecycle as the delegated unprivileged caller. */
+static void delegated_lifecycle(scen *s) {
+    procd_policy p = PROCD_POLICY_INIT;
+    procd_domain *d = NULL;
+    s->req_rc = (int)procd_create_domain(&p, &d);
+    if (!d) return;
+    procd_domain_status st;
+    procd_domain_status_get(d, &st);
+    s->level = (int)st.process_tree_termination;
+    /* a leader plus a setsid'd, double-forked (reparented) descendant */
+    const char *av[] = {"/bin/sh", "-c",
+                        "setsid sh -c 'sleep 30 & echo $! > /tmp/procd_est_gc' &"
+                        " exec sleep 30",
+                        NULL};
+    int64_t pid = -1;
+    unlink("/tmp/procd_est_gc");
+    s->spawn_rc = (int)procd_domain_spawn(d, av, &pid);
+    long gc = 0;
+    for (int i = 0; i < 100 && gc <= 0; i++) {
+        nap(20);
+        FILE *f = fopen("/tmp/procd_est_gc", "r");
+        if (f) {
+            if (fscanf(f, "%ld", &gc) != 1) gc = 0;
+            fclose(f);
+        }
+    }
+    s->uid_ok = uid_of((pid_t)pid) == UNPRIV;
+    if (gc > 0) {
+        char p2[64], b[4096];
+        snprintf(p2, sizeof p2, "/proc/%ld/cgroup", gc);
+        int fd = open(p2, O_RDONLY | O_CLOEXEC);
+        ssize_t r = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;
+        if (fd >= 0) close(fd);
+        b[r > 0 ? r : 0] = 0;
+        s->grouped = strstr(b, "0::") && strstr(b, "/procd.") ? 1 : 0;
+    }
+    procd_termination_evidence ev;
+    procd_domain_terminate(d, 5000, &ev);
+    s->proven = ev.emptiness_proven;
+    s->final = (int)ev.final_state;
+    for (int i = 0; i < 50; i++) {
+        s->survivors = (gc > 0 && executing(gc)) + (pid > 0 && executing((long)pid));
+        if (!s->survivors) break;
+        nap(20);
+    }
+    procd_domain_release(d);
+    unlink("/tmp/procd_est_gc");
+}
+
+/* D: recover `id` under a read-only mount and inspect the reported level. */
+static void downgraded_recovery(const char *id, scen *s) {
+    procd_recovery_outcome o = PROCD_UNRESOLVED;
+    procd_domain *rd = NULL;
+    procd_recover(id, &o, &rd);
+    s->recover_rc = (int)o;
+    if (!rd) return;
+    procd_domain_status st;
+    procd_domain_status_get(rd, &st);
+    s->level = (int)st.process_tree_termination;
+    s->pop_auth = st.population_is_authoritative;
+    procd_termination_evidence ev;
+    procd_domain_terminate(rd, 1000, &ev);
+    s->proven = ev.emptiness_proven;
+    s->final = (int)ev.final_state;
+    procd_domain_release(rd);
+}
+
+/* which: 'A' read-only, 'B' non-delegated, 'C' delegated, 'D' recovery. */
+static int run(char which, const char *arg, scen *out) {
     int pp[2];
     if (pipe(pp) != 0) return -1;
     pid_t ch = fork();
     if (ch == 0) {
         close(pp[0]);
         scen s;
-        memset(&s, 0, sizeof s);
-        s.setup_ok = which == 0 ? make_cgroup_readonly() : drop_cap_setuid();
-        s.req_rc = s.be_ok = s.be_level = s.pop_auth = s.empt_proven = s.final = s.enforced = -1;
-        if (s.setup_ok) {
-            procd_capabilities c;
-            procd_capabilities_probe(&c);
-            s.ptt = (int)c.process_tree_termination;
-            s.emptiness = (int)c.domain_emptiness_proof;
-
-            procd_policy rp = PROCD_POLICY_INIT; /* REQUIRE_ENFORCED */
-            procd_domain *rd = NULL;
-            s.req_rc = (int)procd_create_domain(&rp, &rd);
-            if (rd) procd_domain_release(rd);
-
-            /* Case C (caps scenario only): the cgroup is still writable, so a
-             * best-effort domain can be made and its reporting inspected. Under a
-             * read-only hierarchy the cgroup cannot be created, so skip. */
-            if (which == 1) {
-                procd_policy bp = PROCD_POLICY_INIT;
-                bp.enforcement = PROCD_ALLOW_BEST_EFFORT;
-                procd_domain *bd = NULL;
-                if (procd_create_domain(&bp, &bd) == PROCD_OK && bd) {
-                    s.be_ok = 1;
-                    procd_domain_status st;
-                    procd_domain_status_get(bd, &st);
-                    s.be_level = (int)st.process_tree_termination;
-                    s.pop_auth = st.population_is_authoritative;
-                    procd_termination_evidence ev;
-                    procd_domain_terminate(bd, 3000, &ev);
-                    s.empt_proven = ev.emptiness_proven;
-                    s.final = (int)ev.final_state;
-                    s.enforced = ev.enforced;
-                    procd_domain_release(bd);
-                } else {
-                    s.be_ok = 0;
-                }
+        memset(&s, 0xff, sizeof s); /* every field -1 = not reached */
+        if (which == 'A') {
+            s.setup_ok = make_cgroup_readonly();
+            if (s.setup_ok) probe_and_create(&s);
+        } else if (which == 'B') {
+            s.setup_ok = become_unprivileged(NULL);
+            if (s.setup_ok) probe_and_create(&s);
+        } else if (which == 'C') {
+            s.setup_ok = become_unprivileged(arg);
+            if (s.setup_ok) {
+                procd_capabilities c;
+                procd_capabilities_probe(&c);
+                s.ptt = (int)c.process_tree_termination;
+                delegated_lifecycle(&s);
             }
+        } else {
+            s.setup_ok = make_cgroup_readonly();
+            if (s.setup_ok) downgraded_recovery(arg, &s);
         }
         ssize_t w = write(pp[1], &s, sizeof s);
         (void)w;
-        close(pp[1]);
         _exit(0);
     }
     close(pp[1]);
     ssize_t r = read(pp[0], out, sizeof *out);
     close(pp[0]);
-    int wst = 0;
-    waitpid(ch, &wst, 0);
-    return (r == (ssize_t)sizeof *out) ? 0 : -1;
+    waitpid(ch, NULL, 0);
+    return r == (ssize_t)sizeof *out ? 0 : -1;
 }
 
 int main(void) {
@@ -152,52 +263,77 @@ int main(void) {
     if (geteuid() != 0 || c.process_tree_termination != PROCD_CAP_ENFORCED) {
         const char *v = getenv("PROCD_REQUIRE_ENFORCED");
         int strict = v && strcmp(v, "1") == 0;
-        printf("%s: enforced prerequisites unavailable (%s, euid=%d)\n", strict ? "FAIL" : "SKIP",
-               c.detail, (int)geteuid());
+        printf("%s: needs root to set up the environments and a cgroup-v2 host (%s)\n",
+               strict ? "FAIL" : "SKIP", c.detail);
         return strict ? 1 : 77;
     }
+    scen s;
 
-    /* ---- A: read-only cgroup hierarchy ---- */
-    scen ro;
-    if (run_scenario(0, &ro) == 0 && ro.setup_ok) {
-        printf("   [ro] ptt=%d emptiness=%d req_rc=%d\n", ro.ptt, ro.emptiness, ro.req_rc);
-        CHECK(ro.ptt != PROCD_CAP_ENFORCED,
-              "A: read-only hierarchy is NOT ENFORCED in capabilities");
-        CHECK(ro.emptiness != PROCD_CAP_ENFORCED,
-              "A: read-only hierarchy does not claim ENFORCED emptiness proof");
-        CHECK(ro.req_rc == PROCD_E_UNSUPPORTED_ENFORCEMENT,
-              "A: REQUIRE_ENFORCED refused on a read-only hierarchy");
+    /* ---- A ---- */
+    if (run('A', NULL, &s) != 0 || s.setup_ok != 1) {
+        CHECK(0, "A: could not set up a read-only cgroup mount");
     } else {
-        printf("note: could not make the cgroup hierarchy read-only; skipping case A\n");
+        CHECK(s.ptt != PROCD_CAP_ENFORCED, "A: read-only hierarchy is not ENFORCED");
+        CHECK(s.req_rc == PROCD_E_UNSUPPORTED_ENFORCEMENT, "A: REQUIRE_ENFORCED refused");
+        CHECK(s.allow_rc != PROCD_OK, "A: ALLOW_BEST_EFFORT creates no domain");
     }
 
-    /* ---- B & C: euid 0 without CAP_SETUID ---- */
-    scen cap;
-    if (run_scenario(1, &cap) == 0 && cap.setup_ok) {
-        printf("   [caps] ptt=%d emptiness=%d req_rc=%d be_ok=%d be_level=%d pop_auth=%d "
-               "empt_proven=%d final=%d enforced=%d\n",
-               cap.ptt, cap.emptiness, cap.req_rc, cap.be_ok, cap.be_level, cap.pop_auth,
-               cap.empt_proven, cap.final, cap.enforced);
-        /* B: no ENFORCED inferred from euid 0 alone. */
-        CHECK(cap.ptt != PROCD_CAP_ENFORCED,
-              "B: euid 0 without CAP_SETUID is NOT ENFORCED (not inferred from euid 0 alone)");
-        CHECK(cap.req_rc == PROCD_E_UNSUPPORTED_ENFORCEMENT,
-              "B: REQUIRE_ENFORCED refused when the privilege drop cannot be established");
-        /* C: a downgraded invocation reports honestly. */
-        if (cap.be_ok == 1) {
-            CHECK(cap.be_level != PROCD_CAP_ENFORCED, "C: best-effort domain is not ENFORCED");
-            CHECK(cap.pop_auth == 0, "C: best-effort status population is NOT authoritative (B-1)");
-            CHECK(cap.empt_proven == 0,
-                  "C: best-effort termination does not claim proven emptiness (B-1)");
-            CHECK(cap.final != PROCD_STATE_EMPTY,
-                  "C: best-effort termination does not report a final EMPTY state (B-1)");
-            CHECK(cap.enforced == 0, "C: best-effort termination is not 'enforced'");
-        } else {
-            printf(
-                "note: best-effort create did not succeed under reduced caps; skipping case C\n");
-        }
+    /* ---- B ---- */
+    if (run('B', NULL, &s) != 0 || s.setup_ok != 1) {
+        CHECK(0, "B: could not become an unprivileged caller");
     } else {
-        printf("note: could not drop CAP_SETUID; skipping cases B/C\n");
+        CHECK(s.ptt != PROCD_CAP_ENFORCED, "B: non-delegated unprivileged caller is not ENFORCED");
+        CHECK(s.req_rc == PROCD_E_UNSUPPORTED_ENFORCEMENT, "B: REQUIRE_ENFORCED refused");
+        CHECK(s.allow_rc != PROCD_OK, "B: ALLOW_BEST_EFFORT creates no domain");
+    }
+
+    /* ---- C ---- */
+    char cg[512], deleg[600], f[700];
+    own_cgroup(cg, sizeof cg);
+    snprintf(deleg, sizeof deleg, "%s/procd_est_deleg", cg);
+    mkdir(deleg, 0755);
+    int delegated = chown(deleg, UNPRIV, UNPRIV) == 0;
+    const char *files[] = {"cgroup.procs", "cgroup.subtree_control", "cgroup.threads"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(f, sizeof f, "%s/%s", deleg, files[i]);
+        delegated = delegated && chown(f, UNPRIV, UNPRIV) == 0;
+    }
+    if (!delegated || run('C', deleg, &s) != 0 || s.setup_ok != 1) {
+        CHECK(0, "C: could not set up a delegated unprivileged caller");
+    } else {
+        CHECK(s.ptt == PROCD_CAP_ENFORCED, "C: delegated unprivileged caller probes ENFORCED");
+        CHECK(s.req_rc == PROCD_OK && s.level == PROCD_CAP_ENFORCED,
+              "C: REQUIRE_ENFORCED domain created at ENFORCED without root");
+        CHECK(s.spawn_rc == PROCD_OK && s.uid_ok == 1, "C: workload runs with the caller's uid");
+        CHECK(s.grouped == 1, "C: setsid'd background descendant is in the domain");
+        CHECK(s.proven == 1 && s.final == PROCD_STATE_EMPTY && s.survivors == 0,
+              "C: termination proves emptiness and nothing survives");
+    }
+    rmdir(deleg);
+
+    /* ---- D ---- */
+    procd_policy p = PROCD_POLICY_INIT;
+    procd_domain *d = NULL;
+    char id[PROCD_IDENTITY_MAX] = "";
+    if (procd_create_domain(&p, &d) == PROCD_OK) {
+        const char *av[] = {"sleep", "30", NULL};
+        procd_domain_spawn(d, av, NULL);
+        procd_domain_identity(d, id, sizeof id);
+    }
+    if (!d || run('D', id, &s) != 0 || s.setup_ok != 1) {
+        CHECK(0, "D: could not set up a recovered handle under a read-only mount");
+    } else {
+        CHECK(s.recover_rc == PROCD_RECOVERED, "D: domain recovered");
+        CHECK(s.level != PROCD_CAP_ENFORCED, "D: unusable controls lower the recovered level");
+        CHECK(s.pop_auth == 0, "D: population not reported as authoritative");
+        CHECK(s.proven == 0 && s.final != PROCD_STATE_EMPTY,
+              "D: termination does not claim proven emptiness");
+    }
+    if (d) {
+        procd_termination_evidence ev;
+        procd_domain_terminate(d, 5000, &ev);
+        CHECK(ev.emptiness_proven, "D: the original handle still terminates the domain");
+        procd_domain_release(d);
     }
 
     printf("%s (%d failures)\n", fails ? "FAILURES" : "all establishment checks passed", fails);

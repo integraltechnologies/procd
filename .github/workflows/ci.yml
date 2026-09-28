@@ -97,11 +97,14 @@ jobs:
           if-no-files-found: warn
 
   # ENFORCED QUALIFICATION (Linux). The only job whose green means Linux
-  # ProcessTreeTermination=ENFORCED was demonstrated. A privileged container with
-  # a private cgroup namespace gives root + cgroup v2 + a non-root namespace-root
-  # cgroup exposing cgroup.kill. Every prerequisite is asserted up front, and
-  # PROCD_REQUIRE_ENFORCED=1 turns any skip (missing prerequisite, unobserved
-  # adversarial precondition, inconclusive negative control) into a failure.
+  # ProcessTreeTermination=ENFORCED (OS-enforced lifecycle grouping; not a
+  # sandbox) was demonstrated. A privileged container with a private cgroup
+  # namespace gives cgroup v2 + a namespace-root cgroup exposing cgroup.kill.
+  # Every prerequisite is asserted up front, and PROCD_REQUIRE_ENFORCED=1 turns
+  # any skip (missing prerequisite, unobserved topology precondition,
+  # inconclusive negative control) into a failure. The lifecycle suite is then
+  # repeated as an ordinary unprivileged user in a delegated cgroup-v2 subtree,
+  # the configuration agentctl normally runs in.
   linux-enforced-qualification:
     runs-on: ubuntu-latest
     steps:
@@ -134,7 +137,7 @@ jobs:
             echo "--- qualification (every adversarial scenario must PASS)"
             $B/procd qualify --require-enforced $B/procd-adversary
             $B/procd-qualify-test $B/procd-adversary
-            echo "--- negative control (weakened escapes, production prevents)"
+            echo "--- negative control (process-group termination leaves detached descendants)"
             $B/procd-negative-control-test $B/procd-adversary
             echo "--- recovery"
             $B/procd-recovery-test
@@ -143,4 +146,20 @@ jobs:
             ctest --test-dir $B --output-on-failure --no-tests=error | tee /tmp/ctest.log
             if grep -Eq "Skipped|did not run|Not Run" /tmp/ctest.log; then
               echo "a test was skipped in the ENFORCED qualification job"; exit 1; fi
+
+            echo "--- lifecycle suite as an ordinary user in a delegated subtree"
+            D=/sys/fs/cgroup/agent-deleg
+            mkdir $D
+            chown 1000:1000 $D $D/cgroup.procs $D/cgroup.subtree_control $D/cgroup.threads
+            as_user() { ( echo $BASHPID > $D/cgroup.procs
+                exec setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all \
+                  --bounding-set=-all env HOME=/tmp "$@" ); }
+            as_user grep -q "^CapEff:.0000000000000000" /proc/self/status
+            as_user $B/procd capabilities | tee /tmp/ucaps
+            grep -qx "ProcessTreeTermination:     ENFORCED" /tmp/ucaps
+            grep -qx "SafeRecovery:               UNSUPPORTED" /tmp/ucaps
+            as_user $B/procd qualify --require-enforced $B/procd-adversary
+            for t in qualify race identity fd-inherit spawn-fail negative-control; do
+              as_user $B/procd-$t-test $B/procd-adversary
+            done
           '

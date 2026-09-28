@@ -4,22 +4,21 @@
 #endif
 #endif
 /*
- * Workload identity / privilege-transition regression (Linux, enforced host).
+ * Workload identity regression (Linux, cgroup-v2 lifecycle host).
  *
- * Area 1: the workload must actually run with the intended FINAL credentials,
- * not merely have setuid() called. A sleeper workload is launched into an
- * ENFORCED domain with a non-default identity (uid/gid 4321) and its live
- * /proc/<pid>/status is read INDEPENDENTLY of procd to confirm every credential
- * transition took effect:
- *   - real, effective, saved AND fs uid are all 4321 (setresuid, not just euid);
- *   - real, effective, saved AND fs gid are all 4321;
- *   - no supplementary groups remain;
- *   - the effective (and permitted/inheritable) capability sets are empty;
- *   - no_new_privs is set;
- *   - CapBnd (bounding set) is empty, so no capability can ever be acquired.
+ * procd does not choose a workload identity. The task runs with the caller's
+ * credentials unless an explicit run-as uid/gid is requested, and the lifecycle
+ * level never depends on it. Checked independently of procd via the live
+ * /proc/<pid>/status of the spawned workload:
  *
- * A backend that relied on setuid() alone, or skipped the bounding-set / group /
- * securebits work, would leave one of these fields non-final and fail here.
+ *   - default policy (-1/-1): real/effective/saved/fs uid and gid equal the
+ *     caller's, and the domain is ENFORCED whatever the caller's uid is;
+ *   - uid/gid values that do not round-trip through uid_t/gid_t (or are
+ *     negative other than -1) are rejected at create in either mode;
+ *   - as root, an explicit run-as 4321:4321 is fully applied (all four ids) and
+ *     root's supplementary groups are dropped;
+ *   - as a non-root caller, a run-as it cannot establish fails the spawn and
+ *     runs nothing.
  *
  * SPDX-License-Identifier: MPL-2.0
  */
@@ -31,12 +30,8 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
-#define WUID 4321
-#define WGID 4321
 
 static int fails = 0;
 #define CHECK(cond, msg)                                                                           \
@@ -52,119 +47,123 @@ static void nap(int ms) {
     struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
     nanosleep(&t, NULL);
 }
-
-/* Read /proc/<pid>/status into buf. Returns 1 on success. */
-static int read_status(pid_t pid, char *buf, size_t n) {
-    char p[64];
+/* Parse the numbers after "<key>:" in /proc/<pid>/status (4 for Uid/Gid,
+ * 0.. for Groups). Returns how many were read, -1 if unreadable. */
+static int status_ids(pid_t pid, const char *key, long v[], int max) {
+    char p[64], buf[4096];
     snprintf(p, sizeof p, "/proc/%d/status", (int)pid);
     int fd = open(p, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
-    ssize_t r = read(fd, buf, n - 1);
+    if (fd < 0) return -1;
+    ssize_t r = read(fd, buf, sizeof buf - 1);
     close(fd);
-    if (r <= 0) return 0;
+    if (r <= 0) return -1;
     buf[r] = 0;
-    return 1;
-}
-/* Parse the four ids of a "Key:\tr\te\ts\tfs" line. Returns 1 on success. */
-static int four_ids(const char *status, const char *key, long v[4]) {
-    const char *l = strstr(status, key);
-    if (!l) return 0;
-    return sscanf(l + strlen(key), "%ld\t%ld\t%ld\t%ld", &v[0], &v[1], &v[2], &v[3]) == 4;
-}
-/* Value of a single hex field like "CapEff:\t0000000000000000". */
-static int hex_field(const char *status, const char *key, unsigned long long *out) {
-    const char *l = strstr(status, key);
-    if (!l) return 0;
-    return sscanf(l + strlen(key), "%llx", out) == 1;
-}
-static int int_field(const char *status, const char *key, long *out) {
-    const char *l = strstr(status, key);
-    if (!l) return 0;
-    return sscanf(l + strlen(key), "%ld", out) == 1;
-}
-/* Number of supplementary groups on the "Groups:" line. */
-static int ngroups(const char *status) {
-    const char *l = strstr(status, "\nGroups:");
-    if (!l) return -1;
-    l += strlen("\nGroups:");
+    char k[32];
+    snprintf(k, sizeof k, "\n%s:", key);
+    char *s = strstr(buf, k);
+    if (!s) return -1;
+    s += strlen(k);
     int n = 0;
-    long g;
-    int adv;
-    while (sscanf(l, "%ld%n", &g, &adv) == 1) {
-        n++;
-        l += adv;
+    while (n < max) {
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (*s < '0' || *s > '9') break;
+        v[n++] = strtol(s, &s, 10);
     }
     return n;
 }
+static int all_eq(const long v[4], long want) {
+    return v[0] == want && v[1] == want && v[2] == want && v[3] == want;
+}
+static procd_status create(procd_enforcement mode, int64_t uid, int64_t gid, procd_domain **d) {
+    procd_policy pol = PROCD_POLICY_INIT;
+    pol.enforcement = mode;
+    pol.drop_uid = uid;
+    pol.drop_gid = gid;
+    *d = NULL;
+    return procd_create_domain(&pol, d);
+}
+static void finish(procd_domain *d) {
+    procd_termination_evidence ev;
+    procd_domain_terminate(d, 5000, &ev);
+    procd_domain_release(d);
+}
 
-int main(int argc, char **argv) {
+int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    const char *adv = (argc > 1) ? argv[1] : "procd-adversary";
-    setenv("PROCD_ADV_TTL", "10", 1);
-
     procd_capabilities c;
     procd_capabilities_probe(&c);
-    if (geteuid() != 0 || c.process_tree_termination != PROCD_CAP_ENFORCED) {
+    if (c.process_tree_termination != PROCD_CAP_ENFORCED) {
         const char *v = getenv("PROCD_REQUIRE_ENFORCED");
         int strict = v && strcmp(v, "1") == 0;
-        printf("%s: enforced prerequisites unavailable (%s, euid=%d)\n", strict ? "FAIL" : "SKIP",
-               c.detail, (int)geteuid());
+        printf("%s: cgroup-v2 lifecycle domain unavailable (%s)\n", strict ? "FAIL" : "SKIP",
+               c.detail);
         return strict ? 1 : 77;
     }
-
-    procd_policy pol = PROCD_POLICY_INIT; /* REQUIRE_ENFORCED */
-    pol.drop_uid = WUID;
-    pol.drop_gid = WGID;
+    const char *sleeper[] = {"sleep", "30", NULL};
     procd_domain *d = NULL;
-    procd_status rc = procd_create_domain(&pol, &d);
-    CHECK(rc == PROCD_OK, "created ENFORCED domain with identity 4321:4321");
-    if (rc != PROCD_OK) return 1;
+    long u[4], g[4], groups[64];
 
-    /* "leaf" is a pure bounded sleeper: it runs the workload image and does
-     * nothing but wait, so its /proc/<pid>/status reflects the credentials procd
-     * established before exec. */
-    const char *av[] = {adv, "leaf", NULL};
-    int64_t pid = -1;
-    rc = procd_domain_spawn(d, av, &pid);
-    CHECK(rc == PROCD_OK && pid > 0, "spawned the workload");
+    /* ---- representability: nothing narrows to a different identity ---- */
+    const int64_t two32 = 1LL << 32;
+    CHECK(create(PROCD_REQUIRE_ENFORCED, two32, -1, &d) == PROCD_E_INVALID_ARGUMENT,
+          "uid 2^32 (would truncate to 0) rejected");
+    CHECK(create(PROCD_REQUIRE_ENFORCED, two32 + 1000, -1, &d) == PROCD_E_INVALID_ARGUMENT,
+          "uid 2^32+1000 (would truncate to 1000) rejected");
+    CHECK(create(PROCD_ALLOW_BEST_EFFORT, -1, two32, &d) == PROCD_E_INVALID_ARGUMENT,
+          "gid 2^32 rejected, also under ALLOW_BEST_EFFORT");
+    CHECK(create(PROCD_REQUIRE_ENFORCED, -2, -1, &d) == PROCD_E_INVALID_ARGUMENT,
+          "negative uid other than -1 rejected");
 
-    if (pid > 0) {
-        nap(200);
-        char st[8192];
-        CHECK(read_status((pid_t)pid, st, sizeof st), "read workload /proc/<pid>/status");
-
-        long uid[4] = {-1, -1, -1, -1}, gid[4] = {-1, -1, -1, -1};
-        CHECK(four_ids(st, "\nUid:", uid), "status has a Uid line");
-        CHECK(uid[0] == WUID && uid[1] == WUID && uid[2] == WUID && uid[3] == WUID,
-              "real+effective+saved+fs uid are all the configured identity");
-        CHECK(four_ids(st, "\nGid:", gid), "status has a Gid line");
-        CHECK(gid[0] == WGID && gid[1] == WGID && gid[2] == WGID && gid[3] == WGID,
-              "real+effective+saved+fs gid are all the configured identity");
-
-        CHECK(ngroups(st) == 0, "no supplementary groups remain");
-
-        unsigned long long capeff = ~0ULL, capprm = ~0ULL, capbnd = ~0ULL;
-        CHECK(hex_field(st, "\nCapEff:", &capeff) && capeff == 0,
-              "effective capability set is empty");
-        CHECK(hex_field(st, "\nCapPrm:", &capprm) && capprm == 0,
-              "permitted capability set is empty");
-        CHECK(hex_field(st, "\nCapBnd:", &capbnd) && capbnd == 0,
-              "capability bounding set is empty (no capability can be acquired)");
-
-        long nnp = -1;
-        CHECK(int_field(st, "\nNoNewPrivs:", &nnp) && nnp == 1, "no_new_privs is set");
+    /* ---- default: the caller's credentials, at ENFORCED ---- */
+    CHECK(create(PROCD_REQUIRE_ENFORCED, -1, -1, &d) == PROCD_OK && d,
+          "default policy creates an ENFORCED domain for this caller");
+    if (d) {
+        int64_t pid = -1;
+        CHECK(procd_domain_spawn(d, sleeper, &pid) == PROCD_OK, "spawned with default policy");
+        nap(100);
+        CHECK(status_ids((pid_t)pid, "Uid", u, 4) == 4 && all_eq(u, (long)getuid()),
+              "workload uid (real/eff/saved/fs) equals the caller's");
+        CHECK(status_ids((pid_t)pid, "Gid", g, 4) == 4 && all_eq(g, (long)getgid()),
+              "workload gid (real/eff/saved/fs) equals the caller's");
+        finish(d);
     }
 
-    procd_termination_evidence ev;
-    rc = procd_domain_terminate(d, 5000, &ev);
-    CHECK(rc == PROCD_OK && ev.enforced && ev.final_state == PROCD_STATE_EMPTY,
-          "domain terminates with enforced/empty evidence");
-    if (pid > 0) {
-        for (int i = 0; i < 100 && kill((pid_t)pid, 0) == 0; i++)
-            nap(10);
-        CHECK(kill((pid_t)pid, 0) != 0, "workload is gone after termination");
+    if (geteuid() == 0) {
+        /* ---- explicit run-as, applied and read back ---- */
+        CHECK(create(PROCD_REQUIRE_ENFORCED, 4321, 4321, &d) == PROCD_OK && d,
+              "explicit run-as 4321:4321 domain is ENFORCED");
+        if (d) {
+            int64_t pid = -1;
+            CHECK(procd_domain_spawn(d, sleeper, &pid) == PROCD_OK, "spawned with run-as");
+            nap(100);
+            CHECK(status_ids((pid_t)pid, "Uid", u, 4) == 4 && all_eq(u, 4321),
+                  "run-as uid applied to real/eff/saved/fs");
+            CHECK(status_ids((pid_t)pid, "Gid", g, 4) == 4 && all_eq(g, 4321),
+                  "run-as gid applied to real/eff/saved/fs");
+            CHECK(status_ids((pid_t)pid, "Groups", groups, 64) == 0,
+                  "root's supplementary groups dropped");
+            finish(d);
+        }
+        /* ---- explicit uid 0 is an ordinary identity: lifecycle unaffected ---- */
+        CHECK(create(PROCD_REQUIRE_ENFORCED, 0, 0, &d) == PROCD_OK && d,
+              "explicit run-as 0:0 is still an ENFORCED lifecycle domain");
+        if (d) finish(d);
+    } else {
+        /* ---- a run-as this caller cannot establish fails the spawn ---- */
+        CHECK(create(PROCD_REQUIRE_ENFORCED, 0, -1, &d) == PROCD_OK && d,
+              "domain with an unattainable run-as is created");
+        if (d) {
+            int64_t pid = -1;
+            procd_status rc = procd_domain_spawn(d, sleeper, &pid);
+            CHECK(rc == PROCD_E_PERMISSION && pid == -1,
+                  "spawn fails with PERMISSION and runs nothing");
+            procd_domain_status st;
+            procd_domain_status_get(d, &st);
+            CHECK(st.population == PROCD_POP_EMPTY, "nothing was left in the domain");
+            finish(d);
+        }
     }
-    procd_domain_release(d);
 
     printf("%s (%d failures)\n", fails ? "FAILURES" : "all identity checks passed", fails);
     return fails ? 1 : 0;
@@ -173,7 +172,7 @@ int main(int argc, char **argv) {
 int main(void) {
     const char *v = getenv("PROCD_REQUIRE_ENFORCED");
     int strict = v && strcmp(v, "1") == 0;
-    printf("%s: Linux-only workload-identity regression\n", strict ? "FAIL" : "SKIP");
+    printf("%s: Linux-only identity regression\n", strict ? "FAIL" : "SKIP");
     return strict ? 1 : 77;
 }
 #endif

@@ -8,12 +8,25 @@
  * Objects, macOS) sit beneath this contract; thin language bindings sit above
  * it. No implementation language is architecturally privileged.
  *
+ * Purpose: lifecycle supervision of a task's ordinary process tree. procd
+ * creates an OS lifecycle domain, places the task's first process in it before
+ * the task runs, keeps ordinary descendants associated with it, and terminates
+ * the domain directly -- so a supervisor can cancel a task without
+ * reconstructing a PID tree, and without touching unrelated processes.
+ *
  * North-star semantic:
  *   If procd reports ProcessTreeTermination = ENFORCED for an invocation
- *   domain, then after a successful enforced termination no executable process
- *   owned by that invocation may remain running merely because it forked,
- *   exec'd, detached, changed process groups/sessions, reparented,
- *   double-forked, or otherwise manipulated ordinary process topology.
+ *   domain, then after a successful enforced termination no process of that
+ *   task may remain running merely because it forked, exec'd, detached,
+ *   changed process groups/sessions, reparented, double-forked, or otherwise
+ *   changed ordinary process topology.
+ *
+ * procd is NOT a sandbox or security boundary. The caller is trusted and the
+ * workload is not assumed to try to defeat supervision. Out of scope: a
+ * workload deliberately leaving its domain (e.g. rewriting its cgroup
+ * membership), work handed to external services (systemd, cron, launchd,
+ * container daemons, SCM/WMI, ...), cooperating same-user processes, and
+ * descriptors or other authority the caller deliberately gives the workload.
  *
  * Guiding principles encoded by this ABI:
  *   - Authority beats discovery.       (terminate targets authority, not PIDs)
@@ -51,6 +64,11 @@ extern "C" {
  *   - Once procd_domain_terminate begins on a handle, admission is permanently
  *     closed: any spawn that has not already made its workload executable fails
  *     and runs no workload.
+ *   - A domain is expected to have ONE owning handle at a time. Admission is
+ *     tracked per handle; a second handle to the same domain (e.g. from
+ *     procd_recover while the original is still in use) is not synchronized with
+ *     it beyond what the OS mechanism provides. Terminating through either
+ *     handle still terminates everything the domain holds at that moment.
  *
  * HANDLE LIFETIME.
  *   - procd_domain_release frees the handle. Using a handle after release, or
@@ -78,7 +96,7 @@ typedef enum procd_status {
     PROCD_OK = 0,
     /* The caller requested ENFORCED semantics but the backend could not
      * establish every prerequisite for the hard invariant. The launch or
-     * domain creation was REFUSED. Nothing untrusted was executed. This is a
+     * domain creation was REFUSED. Nothing was executed. This is a
      * success of the fail-closed policy, not a bug. */
     PROCD_E_UNSUPPORTED_ENFORCEMENT = 1,
     /* Host prerequisites (mounts, permissions, kernel features) were absent.
@@ -101,19 +119,17 @@ typedef enum procd_status {
  * A capability level describes how strongly a backend can establish a given
  * property. These are ordered: UNSUPPORTED < BEST_EFFORT < ENFORCED.
  *
- *   ENFORCED    - The OS itself guarantees the property against an adversarial
- *                 workload that manipulates process topology. Backend-specific
- *                 prerequisites for the hard invariant are all established.
- *   BEST_EFFORT - The backend attempts the property using ordinary mechanisms
- *                 that a cooperating workload will respect, but which an
- *                 adversarial workload can defeat.
+ *   ENFORCED    - An OS lifecycle-domain mechanism provides the property
+ *                 directly: ordinary descendant creation stays associated with
+ *                 the domain independently of PID/process-group/session
+ *                 topology, and procd terminates and observes that domain
+ *                 itself. This is lifecycle grouping, not a security boundary
+ *                 against a workload trying to escape (see non-goals above).
+ *   BEST_EFFORT - The backend approximates the property with weaker mechanisms
+ *                 (e.g. process groups) that ordinary topology changes such as
+ *                 setsid or double-fork can defeat.
  *   UNSUPPORTED - No supported mechanism establishes the property. procd will
  *                 not pretend otherwise.
- *
- * Every level describes the FULL property for all executable work the
- * invocation owns, never the narrower behavior of an underlying mechanism. For
- * example, "ordinary descendants stay in the Job" is not ENFORCED descendant
- * containment if the workload has other ways to create work outside the Job.
  */
 typedef enum procd_capability {
     PROCD_CAP_UNSUPPORTED = 0,
@@ -140,20 +156,20 @@ typedef enum procd_crash_behavior {
 } procd_crash_behavior;
 
 typedef struct procd_capabilities {
-    /* The aggregate security claim. ENFORCED here means the full launch
-     * invariant + authoritative termination + emptiness proof all hold. */
+    /* The aggregate lifecycle claim. ENFORCED here means placement before
+     * execution + OS-grouped descendants + domain-directed termination +
+     * domain emptiness observation all hold. */
     procd_capability process_tree_termination;
-    /* No untrusted workload code executes before containment exists. */
+    /* The task's first process is in the domain before it runs task code. */
     procd_capability pre_execution_containment;
-    /* ALL work the workload causes to exist after launch remains inside the
-     * domain, by whatever creation path (not only ordinary child creation). */
+    /* Descendants the task creates through ordinary process creation (fork,
+     * spawn, exec) belong to the domain. */
     procd_capability descendant_containment;
-    /* The domain resists topology-escape tricks (setsid/setpgid/double-fork/
-     * reparent/detach/exec/broker-mediated spawn). */
+    /* That grouping survives ordinary topology changes: setsid, setpgid,
+     * double-fork, reparenting, leader exit, detached background children. */
     procd_capability topology_escape_resistance;
-    /* The backend can obtain OS-backed proof that NO invocation-owned
-     * executable work remains (not merely "a scan found nothing", and not
-     * merely "the kernel object we track is empty"). */
+    /* The OS reports when the domain holds no process (not merely "a scan found
+     * nothing"), which at ENFORCED means none of the task's processes remain. */
     procd_capability domain_emptiness_proof;
     /* Recovery after authority loss is authoritative and never PID-guessed. */
     procd_capability safe_recovery;
@@ -196,18 +212,14 @@ typedef struct procd_policy {
     procd_enforcement enforcement;
     /* Optional label for diagnostics; copied by the library. May be NULL. */
     const char *label;
-    /* Drop to this uid/gid before workload execution where the backend supports
-     * a privilege boundary (Linux). Ignored by backends without a privilege
-     * model.
-     *
-     * -1 requests the backend's default. On Linux, "no change" (staying root)
-     * cannot satisfy the ENFORCED privilege-boundary requirement, so -1 selects
-     * a default UNPRIVILEGED identity (nobody, uid/gid 65534) rather than leaving
-     * the workload privileged. An explicit uid/gid of 0 is a deliberately
-     * privileged workload and can never qualify ENFORCED (it is accepted only
-     * under ALLOW_BEST_EFFORT, at a downgraded level). Values that do not round-
-     * trip through the platform uid_t/gid_t are rejected (they could otherwise
-     * narrow to a different, possibly privileged, identity). */
+    /* Optional run-as identity for spawned workloads (Linux; ignored by
+     * backends without a uid/gid model). -1 (the default) keeps the caller's
+     * credentials. Any other value is applied with the ordinary checked
+     * set*id calls before exec (dropping supplementary groups when the caller
+     * is root) and read back; if it cannot be established the spawn fails and
+     * nothing runs. Values that do not round-trip through the platform
+     * uid_t/gid_t are rejected. This is a convenience, not a sandbox: the
+     * lifecycle level does not depend on it. */
     int64_t drop_uid;
     int64_t drop_gid;
 } procd_policy;
@@ -321,22 +333,19 @@ typedef struct procd_domain procd_domain;
 PROCD_API procd_status procd_create_domain(const procd_policy *policy, procd_domain **out_domain);
 
 /*
- * Spawn a command inside the domain honoring the LAUNCH INVARIANT:
+ * Spawn a command inside the domain:
  *
- *   revalidate prerequisites
- *   establish lifecycle authority
  *   create the initial process WITHOUT permitting workload execution
- *   admit/bind it to the domain
- *   verify containment
- *   establish required exact identity
- *   prevent workload inheritance of privileged lifecycle authority
+ *   admit it to the domain and verify membership
+ *   close inherited descriptors other than stdio (where the backend can)
+ *   apply the optional run-as identity
  *   register supervision
  *   permit workload execution
  *
- * If required containment cannot be established, the launch is REFUSED and no
- * workload code runs. argv is NULL-terminated. out_pid receives the OS process
- * id for DIAGNOSTICS only (it is metadata, never used as authority or identity
- * for termination). May be NULL.
+ * If placement cannot be established, the launch is REFUSED and no workload
+ * code runs; a failed spawn never terminates other work already in the domain. argv is
+ * NULL-terminated. out_pid receives the OS process id for DIAGNOSTICS only (it is metadata, never
+ * used as authority or identity for termination). May be NULL.
  */
 PROCD_API procd_status procd_domain_spawn(procd_domain *domain, const char *const *argv,
                                           int64_t *out_pid);

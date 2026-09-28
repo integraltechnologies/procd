@@ -4,15 +4,14 @@
 #endif
 #endif
 /*
- * Explicit file-descriptor inheritance regression (Linux, enforced host).
+ * Descriptor-leak regression (Linux, cgroup-v2 lifecycle host; root not needed).
  *
- * Area 2: a workload must not accidentally inherit arbitrary descriptors the
- * caller opened. Unlike fd_escape_test (which uses a foreign cgroup.procs to
- * prove containment is not defeated), this uses an ORDINARY writable file to
- * prove the more general property: a descriptor the controller left open -- and
- * deliberately left NOT close-on-exec -- is simply not usable by the workload,
- * because procd closes the child's inherited descriptors before exec rather than
- * relying on FD_CLOEXEC.
+ * A task must not accidentally inherit descriptors its supervisor happened to
+ * have open (pipes, sockets, files): a leaked pipe held by a background
+ * descendant is a classic way for a supervisor to hang waiting for EOF. A
+ * writable descriptor the caller left open -- and NOT close-on-exec -- must not
+ * be usable by the workload, because procd closes the child's inherited
+ * descriptors (other than stdio) before exec rather than relying on FD_CLOEXEC.
  *
  * Independent oracle: the file's own contents. If the descriptor survived into
  * the workload, the workload's write lands in the file; production must leave the
@@ -22,6 +21,7 @@
  * SPDX-License-Identifier: MPL-2.0
  */
 #include "procd.h"
+#include "witness.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
 
     procd_capabilities c;
     procd_capabilities_probe(&c);
-    if (geteuid() != 0 || c.process_tree_termination != PROCD_CAP_ENFORCED) {
+    if (c.process_tree_termination != PROCD_CAP_ENFORCED) {
         const char *v = getenv("PROCD_REQUIRE_ENFORCED");
         int strict = v && strcmp(v, "1") == 0;
         printf("%s: enforced prerequisites unavailable (%s, euid=%d)\n", strict ? "FAIL" : "SKIP",
@@ -67,9 +67,8 @@ int main(int argc, char **argv) {
         return strict ? 1 : 77;
     }
 
-    /* The caller deliberately opens an extra writable descriptor before spawning
-     * and, like a careless (or hostile) controller, leaves it NOT close-on-exec
-     * at a fixed high number. */
+    /* The caller has an extra writable descriptor open when it spawns, NOT
+     * close-on-exec, at a fixed high number. */
     char tmpl[] = "/tmp/procd_fdinherit.XXXXXX";
     int src = mkstemp(tmpl);
     CHECK(src >= 0, "created a writable probe file");
@@ -81,7 +80,7 @@ int main(int argc, char **argv) {
     CHECK(fcntl(leakfd, F_GETFD) != -1, "probe descriptor is genuinely open in the caller");
     char fds[16];
     snprintf(fds, sizeof fds, "%d", leakfd);
-    setenv("PROCD_ADV_ESCAPE_FD", fds, 1);
+    setenv("PROCD_ADV_WRITE_FD", fds, 1);
 
     procd_policy pol = PROCD_POLICY_INIT; /* REQUIRE_ENFORCED */
     procd_domain *d = NULL;
@@ -93,17 +92,27 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* "fdescape" writes through PROCD_ADV_ESCAPE_FD if it can; here that fd points
-     * at the ordinary probe file, so a successful write would grow the file. */
-    const char *av[] = {adv, "fdescape", NULL};
+    /* "fdwrite" writes through PROCD_ADV_WRITE_FD if it can; that fd points at
+     * the probe file, so a successful write would grow the file. The probe
+     * witnesses its own attempt ("fd-ok"/"fd-denied"), so an empty file cannot
+     * pass merely because the workload never ran. */
+    char wd[64];
+    CHECK(w_dir_create(wd, sizeof wd) == 0, "created a witness directory");
+    setenv(W_ENV, wd, 1);
+    const char *av[] = {adv, "fdwrite", NULL};
     rc = procd_domain_spawn(d, av, NULL);
     CHECK(rc == PROCD_OK, "spawned the fd-probe workload");
 
-    /* Give the workload ample time to attempt the write. */
-    for (int i = 0; i < 100; i++) {
+    static w_rec w[W_MAX];
+    int n = 0;
+    const w_rec *okw = NULL, *denied = NULL;
+    for (int i = 0; i < 150 && !okw && !denied; i++) {
         nap(20);
-        if (file_size(tmpl) > 0) break;
+        n = w_read(wd, w, W_MAX);
+        okw = w_find(w, n, "fd-ok");
+        denied = w_find(w, n, "fd-denied");
     }
+    CHECK(denied && !okw, "probe ran and witnessed that the inherited descriptor was unusable");
     long sz = file_size(tmpl);
     printf("   probe file size after workload = %ld\n", sz);
     CHECK(sz == 0,
@@ -123,6 +132,8 @@ int main(int argc, char **argv) {
     close(leakfd);
     unlink(tmpl);
     procd_domain_release(d);
+    unsetenv(W_ENV);
+    w_dir_remove(wd);
     printf("%s (%d failures)\n", fails ? "FAILURES" : "all fd-inheritance checks passed", fails);
     return fails ? 1 : 0;
 }

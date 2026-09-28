@@ -88,13 +88,11 @@ struct procd_backend {
 const struct procd_backend *procd_active_backend(void);
 
 /*
- * TEST-ONLY negative-control knobs. Production builds compile these to no-ops
- * that always return 0. Builds configured with PROCD_ENABLE_NEGATIVE_CONTROL
- * expose real switches so qualification can prove (a) the harness detects the
- * escape it claims to prevent, and (b) a failed workload credential transition
- * fails the launch closed and runs no workload. See tests/.
+ * TEST-ONLY negative-control knob. Production builds compile this to a no-op
+ * that always returns 0. Builds configured with PROCD_ENABLE_NEGATIVE_CONTROL
+ * expose a real switch so qualification can prove the harness detects the
+ * lifecycle failure the production mechanism prevents. See tests/.
  */
 int procd_nc_weaken_containment(void);
-int procd_nc_fail_credentials(void);
 
 #endif /* PROCD_BACKEND_H */
