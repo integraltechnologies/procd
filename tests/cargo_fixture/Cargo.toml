@@ -1,0 +1,14 @@
+# Real Cargo workload for procd's lifecycle qualification (tests/cargo_test.c).
+# Nothing here is published or used outside the test.
+[package]
+name = "procd-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[dependencies]
+slowmacro = { path = "slowmacro" }
+
+[workspace]
+members = ["slowmacro"]

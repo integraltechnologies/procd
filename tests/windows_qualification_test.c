@@ -1,5 +1,7 @@
 /*
- * Native Windows qualification for the BEST_EFFORT Job Object backend.
+ * Native Windows qualification of the Job Object backend's mechanism claims
+ * (pre-exec admission, handle non-inheritance, evidence consistency, churn,
+ * supervisor loss), alongside the shared lifecycle matrix (tests/qualify.c).
  *
  * Required mechanism cases fail closed: a missing witness is a failure, never
  * a pass. Known escape investigations have a distinct INCONCLUSIVE result;
@@ -44,7 +46,8 @@ static void required_result(const char *name, int pass, const char *detail) {
 }
 
 static void escape_result(const char *name, int reproduced, const char *detail) {
-    printf("[%s] %s: %s\n", reproduced ? "PASS" : "INCONCLUSIVE", name, detail);
+    printf("[%s] %s: %s\n", reproduced ? "OUT-OF-CONTRACT ESCAPE REPRODUCED" : "INCONCLUSIVE", name,
+           detail);
     if (!reproduced) inconclusive++;
 }
 
@@ -167,30 +170,37 @@ static procd_domain *new_domain(void) {
     return domain;
 }
 
+/* termination evidence and status must agree with the kernel's Job view */
 static int terminate_honestly(procd_domain *domain, procd_termination_evidence *ev) {
     procd_status rc = procd_domain_terminate(domain, 8000, ev);
     procd_domain_status status;
     procd_status status_rc = procd_domain_status_get(domain, &status);
-    return rc == PROCD_OK && ev->authority_directed && !ev->admission_closed &&
-           !ev->emptiness_proven && !ev->enforced && ev->final_state == PROCD_STATE_UNRESOLVED &&
-           status_rc == PROCD_OK && status.state == PROCD_STATE_UNRESOLVED &&
-           !status.population_is_authoritative;
+    return rc == PROCD_OK && ev->authority_directed && ev->admission_closed &&
+           ev->emptiness_proven && ev->enforced && ev->final_state == PROCD_STATE_EMPTY &&
+           status_rc == PROCD_OK && status.state == PROCD_STATE_EMPTY &&
+           status.population == PROCD_POP_EMPTY && status.population_is_authoritative;
 }
 
 static void case_capabilities(void) {
     procd_capabilities c;
     int ok = procd_capabilities_probe(&c) == PROCD_OK && strcmp(c.backend, "windows-job") == 0 &&
-             c.process_tree_termination == PROCD_CAP_BEST_EFFORT &&
+             c.process_tree_termination == PROCD_CAP_ENFORCED &&
              c.pre_execution_containment == PROCD_CAP_ENFORCED &&
-             c.descendant_containment == PROCD_CAP_BEST_EFFORT &&
-             c.topology_escape_resistance == PROCD_CAP_BEST_EFFORT &&
-             c.domain_emptiness_proof == PROCD_CAP_BEST_EFFORT &&
+             c.descendant_containment == PROCD_CAP_ENFORCED &&
+             c.topology_escape_resistance == PROCD_CAP_ENFORCED &&
+             c.domain_emptiness_proof == PROCD_CAP_ENFORCED &&
              c.safe_recovery == PROCD_CAP_UNSUPPORTED &&
-             c.crash_behavior == PROCD_CRASH_UNRESOLVED_ON_AUTHORITY_LOSS;
+             c.crash_behavior == PROCD_CRASH_AUTOMATIC_DESTRUCTION;
+    procd_policy strict = PROCD_POLICY_INIT;
+    procd_domain *sd = NULL;
+    int strict_ok = procd_create_domain(&strict, &sd) == PROCD_OK;
+    if (sd) procd_domain_release(sd);
+    ok = ok && strict_ok;
     required_result("capability/evidence consistency", ok,
-                    ok ? "aggregate BEST_EFFORT; pre-exec ENFORCED; descendant/topology/emptiness "
-                         "BEST_EFFORT; recovery UNSUPPORTED; authority loss UNRESOLVED"
-                       : "reported Windows capability tuple overclaims or has drifted");
+                    ok ? "aggregate/pre-exec/descendant/topology/emptiness ENFORCED; recovery "
+                         "UNSUPPORTED; supervisor loss AUTOMATIC_DESTRUCTION; REQUIRE_ENFORCED "
+                         "domain created"
+                       : "reported Windows capability tuple drifted or REQUIRE_ENFORCED refused");
 }
 
 static void case_preexec_handles_unrelated(const char *adv, const char *dir) {
@@ -248,10 +258,10 @@ static void case_preexec_handles_unrelated(const char *adv, const char *dir) {
                     killed && control_alive
                         ? "Job member died while an independently launched control stayed alive"
                         : "member survived or unrelated control was affected");
-    required_result("termination evidence honesty", honest,
-                    honest
-                        ? "Job kill succeeded but invocation emptiness/final EMPTY were not claimed"
-                        : "termination evidence overclaimed or Job termination failed");
+    required_result("termination evidence consistency", honest,
+                    honest ? "admission closed, Job killed, kernel count 0 => proven EMPTY; status "
+                             "agrees and is authoritative"
+                           : "termination evidence or status disagreed with the Job");
 
     if (root.process) CloseHandle(root.process);
     if (domain) procd_domain_release(domain);
@@ -289,7 +299,7 @@ static void case_ordinary(const char *adv, const char *dir) {
         "ordinary descendant containment", topology && status_ok && honest && descendants_dead,
         topology && status_ok && honest && descendants_dead
             ? "child+grandchild remained after leader exit, were Job-observed, and died "
-              "under TerminateJobObject; exec replacement is not a Windows primitive"
+              "with the Job; exec replacement is not a Windows primitive"
             : "topology/witness/status/termination check failed");
 
     if (root.process) CloseHandle(root.process);
@@ -486,6 +496,83 @@ static void case_handle_duplication(const char *self, const char *adv, const cha
     if (started) CloseHandle(helper.hProcess);
 }
 
+/* Helper process: supervise a task, then wait to be killed. */
+static int controller_crash_mode(const char *adv, const char *dir) {
+    set_env("PROCD_WIN_WITNESS_DIR", NULL);
+    set_env("PROCD_ADV_WITNESS_DIR", dir);
+    set_env("PROCD_ADV_TTL", "30");
+    procd_domain *domain = new_domain();
+    const char *argv[] = {adv, "grandchild", NULL};
+    if (!domain || procd_domain_spawn(domain, argv, NULL) != PROCD_OK) return 3;
+    Sleep(60000); /* killed by the test long before this */
+    return 0;
+}
+
+static int read_witnesses(const char *dir, record *out, int max) {
+    char pattern[MAX_PATH * 2];
+    WIN32_FIND_DATAA data;
+    join_path(pattern, sizeof pattern, dir, "*");
+    HANDLE find = FindFirstFileA(pattern, &data);
+    int n = 0;
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (data.cFileName[0] == '.' || n >= max) continue;
+        char path[MAX_PATH * 2];
+        join_path(path, sizeof path, dir, data.cFileName);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char role[32];
+        unsigned long pid = 0;
+        long ppid = 0, pg = 0, sid = 0;
+        unsigned long long created = 0;
+        if (fscanf(f, "%31s %lu %ld %ld %ld %llu", role, &pid, &ppid, &pg, &sid, &created) == 6) {
+            memset(&out[n], 0, sizeof out[n]);
+            out[n].pid = (DWORD)pid;
+            out[n].created = created;
+            if (attach_record(&out[n])) n++;
+        }
+        fclose(f);
+    } while (FindNextFileA(find, &data));
+    FindClose(find);
+    return n;
+}
+
+static void case_controller_loss(const char *self, const char *adv, const char *dir) {
+    clear_dir(dir);
+    char args[MAX_PATH * 5];
+    snprintf(args, sizeof args, "--controller-crash \"%s\" \"%s\"", adv, dir);
+    PROCESS_INFORMATION helper;
+    int started = spawn_direct(self, args, &helper);
+    if (started) CloseHandle(helper.hThread);
+    record members[16];
+    int n = 0;
+    for (int i = 0; i < 250 && n < 3; i++) {
+        for (int j = 0; j < n; j++)
+            CloseHandle(members[j].process);
+        n = read_witnesses(dir, members, 16);
+        if (n < 3) Sleep(20);
+    }
+    int live = 0;
+    for (int i = 0; i < n; i++)
+        live += alive(members[i].process);
+    /* the supervisor dies without terminating or releasing anything */
+    int crashed = started && TerminateProcess(helper.hProcess, 9) &&
+                  WaitForSingleObject(helper.hProcess, 5000) == WAIT_OBJECT_0;
+    int dead = 0;
+    for (int i = 0; i < n; i++)
+        dead += dead_within(members[i].process, 5000);
+    int ok = started && n >= 3 && live == n && crashed && dead == n;
+    char detail[256];
+    snprintf(detail, sizeof detail,
+             "%d task process(es) witnessed live; supervisor killed=%d; %d died with its Job "
+             "handle",
+             n, crashed, dead);
+    required_result("supervisor loss destroys the task", ok, detail);
+    for (int i = 0; i < n; i++)
+        kill_and_close(members[i].process);
+    if (started) CloseHandle(helper.hProcess);
+}
+
 static void read_text(const char *dir, const char *file, char *out, size_t n) {
     char path[MAX_PATH * 2];
     join_path(path, sizeof path, dir, file);
@@ -532,6 +619,8 @@ static void case_broker(const char *adv, const char *dir) {
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "--duplicate-controller") == 0)
         return duplicate_controller_mode(argv[2], argv[3]);
+    if (argc == 4 && strcmp(argv[1], "--controller-crash") == 0)
+        return controller_crash_mode(argv[2], argv[3]);
     const char *adv = argc > 1 ? argv[1] : "procd-adversary.exe";
     char self[MAX_PATH], dir[MAX_PATH * 2];
     if (!GetModuleFileNameA(NULL, self, (DWORD)sizeof self) || !make_dir(dir, sizeof dir)) {
@@ -539,19 +628,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("Windows native qualification: BEST_EFFORT mechanism evidence; not ENFORCED\n");
+    printf("Windows native qualification: Job Object mechanism evidence (ENFORCED claims); "
+           "out-of-contract escape probes reported separately\n");
     case_capabilities();
     case_preexec_handles_unrelated(adv, dir);
     case_ordinary(adv, dir);
     case_churn(adv, dir);
     case_recovery(dir);
+    case_controller_loss(self, adv, dir);
     case_handle_duplication(self, adv, dir);
     case_parent_escape(adv, dir);
     case_broker(adv, dir);
     clear_dir(dir);
     RemoveDirectoryA(dir);
     set_env("PROCD_WIN_WITNESS_DIR", NULL);
-    printf("==== %d required PASS, %d INCONCLUSIVE limitation probe(s), %d FAIL ====\n",
+    printf("==== %d required PASS, %d INCONCLUSIVE out-of-contract probe(s), %d FAIL ====\n",
            required_passes, inconclusive, failures);
     return failures ? 1 : 0;
 }

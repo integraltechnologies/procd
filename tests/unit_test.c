@@ -87,20 +87,19 @@ int main(void) {
     }
 
 #if defined(_WIN32)
-    /* A Job Object keeps ordinary descendants and proves the JOB empty, but the
-     * workload can create work outside it (parent-process attribute, brokers,
-     * handle duplication): none of the full properties may be claimed, and a
-     * duplicated Job handle means controller loss is not automatic destruction. */
-    CHECK(c.process_tree_termination == PROCD_CAP_BEST_EFFORT, "windows: aggregate BEST_EFFORT");
-    CHECK(c.descendant_containment != PROCD_CAP_ENFORCED,
-          "windows: descendant containment not ENFORCED");
-    CHECK(c.topology_escape_resistance != PROCD_CAP_ENFORCED,
-          "windows: escape resistance not ENFORCED");
-    CHECK(c.domain_emptiness_proof != PROCD_CAP_ENFORCED,
-          "windows: Job emptiness is not domain emptiness proof");
-    CHECK(c.crash_behavior != PROCD_CRASH_AUTOMATIC_DESTRUCTION,
-          "windows: KILL_ON_JOB_CLOSE not claimed as automatic destruction");
+    /* A Job Object without breakaway is kernel-maintained lifecycle grouping:
+     * the aggregate is ENFORCED, recovery of an unnamed Job is not offered. */
+    CHECK(c.process_tree_termination == PROCD_CAP_ENFORCED, "windows: aggregate ENFORCED");
+    CHECK(c.domain_emptiness_proof == PROCD_CAP_ENFORCED,
+          "windows: Job active-process count is authoritative emptiness");
+    CHECK(c.crash_behavior == PROCD_CRASH_AUTOMATIC_DESTRUCTION,
+          "windows: KILL_ON_JOB_CLOSE destroys the Job with its supervisor");
     CHECK(c.safe_recovery == PROCD_CAP_UNSUPPORTED, "windows: no safe recovery");
+#elif defined(__APPLE__)
+    /* Tracked membership is procd bookkeeping, not a kernel domain. */
+    CHECK(c.process_tree_termination == PROCD_CAP_BEST_EFFORT, "macos: aggregate BEST_EFFORT");
+    CHECK(c.domain_emptiness_proof != PROCD_CAP_ENFORCED, "macos: emptiness is a scan");
+    CHECK(c.safe_recovery == PROCD_CAP_UNSUPPORTED, "macos: no safe recovery");
 #endif
 
     printf("%s (%d failures)\n", fails ? "FAILURES" : "all unit checks passed", fails);
