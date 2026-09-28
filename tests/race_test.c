@@ -4,7 +4,7 @@
 #endif
 #endif
 /*
- * Spawn-vs-terminate concurrency regression (Linux, needs the enforced host).
+ * Spawn-vs-terminate concurrency regression (Linux cgroup-v2 host; root not needed).
  *
  * Repeatedly races a spawn against a terminate on the same domain, started
  * together at a barrier, and independently verifies the invariant:
@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
 
     procd_capabilities c;
     procd_capabilities_probe(&c);
-    if (geteuid() != 0 || c.process_tree_termination != PROCD_CAP_ENFORCED) {
+    if (c.process_tree_termination != PROCD_CAP_ENFORCED) {
         const char *v = getenv("PROCD_REQUIRE_ENFORCED");
         int strict = v && strcmp(v, "1") == 0;
         printf("%s: enforced prerequisites unavailable (%s, euid=%d)\n", strict ? "FAIL" : "SKIP",

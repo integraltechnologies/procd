@@ -6,7 +6,8 @@
 /*
  * Recovery regression test (Linux, needs the enforced prerequisites).
  *
- * Each case is a concrete exploit against durable recovery. The independent
+ * Each case is a concrete stale/corrupted-token or wrong-target case for durable
+ * recovery. The independent
  * oracle is the test's own child processes (reaped with waitpid, so a zombie is
  * never mistaken for a survivor) and cgroups the test itself created:
  *
@@ -17,8 +18,11 @@
  *   - a live domain's token with an edited boot id, path, inode or level must
  *     not become CONFIRMED_DESTROYED or RECOVERED (it disagrees with the
  *     protected record);
- *   - a domain established below ENFORCED (non-root) must never recover as
- *     ENFORCED;
+ *   - a domain created by an unprivileged caller (no protected record) is never
+ *     recovered;
+ *   - a missing cgroup is CONFIRMED_DESTROYED only for a domain recorded at
+ *     ENFORCED; a record below ENFORCED stays UNRESOLVED (its cgroup being gone
+ *     does not prove the task's processes are gone);
  *   - the genuine token recovers the exact domain at its established level, the
  *     recovered handle can spawn into and terminate it, and afterwards the
  *     genuine token is CONFIRMED_DESTROYED.
@@ -73,16 +77,17 @@ static unsigned long long ino_of(const char *p) {
     struct stat st;
     return stat(p, &st) == 0 ? (unsigned long long)st.st_ino : 0;
 }
-/* absolute path of this process's cgroup */
+/* absolute path of this process's cgroup-v2 cgroup (the "0::" line) */
 static void own_cgroup(char *out, size_t n) {
-    char b[512] = {0};
+    char b[4096] = {0};
     int fd = open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
     ssize_t r = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;
     if (fd >= 0) close(fd);
     if (r < 0) r = 0;
     b[r] = 0;
-    b[strcspn(b, "\n")] = 0;
-    const char *rel = strrchr(b, ':') ? strrchr(b, ':') + 1 : "/";
+    const char *rel = "/";
+    for (char *line = strtok(b, "\n"); line; line = strtok(NULL, "\n"))
+        if (strncmp(line, "0::", 3) == 0) rel = line + 3;
     snprintf(out, n, "/sys/fs/cgroup%s", strcmp(rel, "/") == 0 ? "" : rel);
 }
 /* bounded sleeper child of this test, placed into cgroup cg */
@@ -166,32 +171,31 @@ static procd_recovery_outcome try_recover(const char *id, const char *what) {
     return o;
 }
 
-/* A domain established by a non-root user in a subtree it owns: BEST_EFFORT. */
-static int best_effort_identity(const char *parent_cg, char *id, size_t n, char *leaf_dir,
-                                size_t ln) {
-    char deleg[600];
+/* A domain created by a non-root user in a subtree delegated to it (the
+ * directory and its cgroup.procs chowned, as systemd delegation does). Such a
+ * caller cannot write the root-owned record store, so the domain has no record. */
+static int unprivileged_identity(const char *parent_cg, char *id, size_t n, char *leaf_dir,
+                                 size_t ln) {
+    char deleg[600], f[700];
     snprintf(deleg, sizeof deleg, "%s/procd_rt_deleg", parent_cg);
     mkdir(deleg, 0755);
     if (chown(deleg, 65533, 65533) != 0) return -1;
+    snprintf(f, sizeof f, "%s/cgroup.procs", deleg);
+    if (chown(f, 65533, 65533) != 0) return -1;
     int pp[2];
     if (pipe(pp) != 0) return -1;
     pid_t c = fork();
     if (c == 0) {
         close(pp[0]);
-        char procs[700], s[16];
-        snprintf(procs, sizeof procs, "%s/cgroup.procs", deleg);
+        char s[16];
         snprintf(s, sizeof s, "%d", (int)getpid());
-        if (write_str(procs, s) != 0 || setgroups(0, NULL) != 0 || setgid(65533) != 0 ||
+        if (write_str(f, s) != 0 || setgroups(0, NULL) != 0 || setgid(65533) != 0 ||
             setuid(65533) != 0)
             _exit(1);
         procd_policy pol = PROCD_POLICY_INIT;
-        pol.enforcement = PROCD_ALLOW_BEST_EFFORT;
         procd_domain *d = NULL;
         char buf[PROCD_IDENTITY_MAX] = {0};
         if (procd_create_domain(&pol, &d) != PROCD_OK) _exit(2);
-        procd_domain_status st;
-        procd_domain_status_get(d, &st);
-        if (st.process_tree_termination == PROCD_CAP_ENFORCED) _exit(3);
         procd_domain_identity(d, buf, sizeof buf);
         ssize_t w = write(pp[1], buf, strlen(buf));
         (void)w;
@@ -206,6 +210,20 @@ static int best_effort_identity(const char *parent_cg, char *id, size_t n, char 
     id[r] = 0;
     snprintf(leaf_dir, ln, "%s", deleg);
     return 0;
+}
+
+/* Rewrite the recorded level of the domain named by id (test-only, as root). */
+static int set_record_level(const char *id, char level) {
+    char nonce[40], p[256], b[1024];
+    snprintf(nonce, sizeof nonce, "%.32s", id + strlen("linux-cgroup2:2:"));
+    snprintf(p, sizeof p, "/var/lib/procd/%s.rec", nonce);
+    int fd = open(p, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t r = read(fd, b, sizeof b - 1);
+    char *lv = r > 0 ? (b[r] = 0, strstr(b, "\nlevel=")) : NULL;
+    int ok = lv && pwrite(fd, &level, 1, (lv - b) + 7) == 1;
+    close(fd);
+    return ok ? 0 : -1;
 }
 
 int main(void) {
@@ -316,19 +334,18 @@ int main(void) {
         CHECK(alive((pid_t)member), "B5 oracle: live domain member untouched");
     }
 
-    /* ---- B4: no promotion of a domain established below ENFORCED ---- */
+    /* ---- a domain without a protected record is never recovered ---- */
     {
-        char beid[PROCD_IDENTITY_MAX], deleg[600];
-        if (best_effort_identity(cg, beid, sizeof beid, deleg, sizeof deleg) == 0) {
-            printf("   best-effort identity %s\n", beid);
-            procd_recovery_outcome o = try_recover(beid, "non-root BEST_EFFORT domain, as root");
-            CHECK(o == PROCD_UNRESOLVED,
-                  "B4: BEST_EFFORT domain is never recovered (let alone as ENFORCED)");
+        char uid[PROCD_IDENTITY_MAX], deleg[600];
+        if (unprivileged_identity(cg, uid, sizeof uid, deleg, sizeof deleg) == 0) {
+            printf("   unprivileged identity %s\n", uid);
+            procd_recovery_outcome o = try_recover(uid, "unprivileged domain, as root");
+            CHECK(o == PROCD_UNRESOLVED, "domain without a protected record is UNRESOLVED");
             char bp[600];
-            snprintf(bp, sizeof bp, "%s", strrchr(beid, ':') + 1);
+            snprintf(bp, sizeof bp, "%s", strrchr(uid, ':') + 1);
             rmdir(bp);
         } else {
-            CHECK(0, "B4: could not establish a non-root BEST_EFFORT domain for the check");
+            CHECK(0, "could not create a domain as an unprivileged delegated user");
         }
         rmdir(deleg);
     }
@@ -368,6 +385,15 @@ int main(void) {
     /* ---- after destruction: genuine token is CONFIRMED_DESTROYED ---- */
     CHECK(try_recover(id, "genuine token after termination") == PROCD_CONFIRMED_DESTROYED,
           "genuine token of a destroyed domain is CONFIRMED_DESTROYED");
+
+    /* ---- a record below ENFORCED never yields CONFIRMED_DESTROYED ---- */
+    {
+        char t[1200];
+        with_field(id, F_LEVEL, "1", t, sizeof t);
+        CHECK(set_record_level(id, '1') == 0, "record rewritten to BEST_EFFORT (test setup)");
+        CHECK(try_recover(t, "vanished BEST_EFFORT domain") == PROCD_UNRESOLVED,
+              "vanished domain recorded BEST_EFFORT is UNRESOLVED, not CONFIRMED_DESTROYED");
+    }
 
     procd_domain_release(d);
     kill(vp, SIGKILL);

@@ -2,11 +2,18 @@
 
 Cross-platform process **lifecycle ownership and supervision**.
 
-`procd` establishes an *invocation domain* that owns everything a launched
-workload does, so that a domain can later be terminated with authoritative,
-OS-backed evidence that **no owned executable work remains** — even if the
-workload forked, exec'd, detached, changed process groups or sessions,
-reparented, double-forked, or otherwise manipulated ordinary process topology.
+`procd` establishes an *invocation domain* for a task, so that a supervisor can
+later terminate the task's whole process tree with OS-backed evidence that
+**none of its processes remain** — even if the task forked, exec'd, detached,
+changed process groups or sessions, reparented, double-forked, or otherwise
+changed ordinary process topology — without reconstructing a PID tree and
+without touching unrelated processes.
+
+`procd` is lifecycle supervision, **not a sandbox**. The caller is trusted and
+the workload is not assumed to try to defeat supervision; deliberately leaving
+the domain (e.g. rewriting cgroup membership), work handed to external services
+(systemd, cron, launchd, container daemons, SCM/WMI), and authority the caller
+deliberately hands the workload are outside the contract.
 
 Its guiding principles:
 
@@ -37,18 +44,21 @@ not require re-designing the lifecycle semantics.
 
 ## Capability model
 
-Each property is reported as `ENFORCED` (the OS guarantees it against an
-adversarial workload), `BEST_EFFORT` (a cooperating workload respects it, an
-adversary can defeat it), or `UNSUPPORTED`. `ProcessTreeTermination` is the
-aggregate hard claim and is only `ENFORCED` when every backend prerequisite for
-the invariant is established **at runtime** — the backend revalidates
-prerequisites and fails closed even if the caller skipped capability discovery.
+Each property is reported as `ENFORCED` (an OS lifecycle-domain mechanism
+provides it directly: ordinary descendants stay grouped independently of
+PID/process-group/session topology, and procd terminates and observes the
+domain itself), `BEST_EFFORT` (approximated with weaker mechanisms, e.g.
+process groups, that ordinary topology changes such as `setsid` can defeat), or
+`UNSUPPORTED`. `ProcessTreeTermination` is the aggregate claim and is only
+`ENFORCED` when the backend establishes it on the actual domain **at runtime**;
+it fails closed rather than silently downgrading, even if the caller skipped
+capability discovery.
 
 ## Platform status
 
 | Platform | Mechanism | `ProcessTreeTermination` | Notes |
 |----------|-----------|--------------------------|-------|
-| **Linux** | cgroup v2 protected hierarchy, `cgroup.kill`, privilege drop | **ENFORCED** (root + cgroup v2 + `cgroup.kill`) | Workload admitted before exec; dropped to an unprivileged uid so it cannot migrate out of the domain. Emptiness proven via `cgroup.events` `populated==0`. Durable identity names a root-owned record in `/var/lib/procd`; recovery trusts only that record (boot id, cgroup view, path, inode, established level), so an edited identity yields `UNRESOLVED` rather than redirecting authority. Falls back to `BEST_EFFORT`/refusal without the prerequisites. |
+| **Linux** | cgroup v2 child of procd's own cgroup, `cgroup.kill`, `cgroup.events` | **ENFORCED** (cgroup v2 + `cgroup.kill` + a writable own cgroup: root, or an ordinary user with a delegated subtree) | Workload admitted to the cgroup and verified before exec; it runs with the caller's credentials (optional explicit run-as uid/gid). Termination writes `cgroup.kill`; emptiness via `cgroup.events` `populated 0`. Recovery (root only) trusts a root-owned record in `/var/lib/procd` (boot id, cgroup view, path, inode, level), so a stale or edited identity yields `UNRESOLVED` rather than redirecting termination. Without a usable cgroup-v2 domain nothing is created (no Linux fallback). |
 | **Windows** | unnamed Job Object, `KILL_ON_JOB_CLOSE`, no breakaway | **BEST_EFFORT** | Suspended-create → assign-to-Job → verify → resume. Job-tracked descendant containment and emptiness (`ActiveProcesses==0`) are authoritative, but broker/parent-substitution escapes (WMI, Task Scheduler, SCM, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`) are **not** closed, so the aggregate is deliberately **not** `ENFORCED`. |
 | **macOS** | — | **UNSUPPORTED** | No supported mechanism (tested on macOS 26.4 arm64) provides inherited, non-escapable, authoritatively-terminable domains: process groups escape via `setpgid`/`setsid`/double-fork; `EVFILT_PROC` `NOTE_TRACK` is `ENOTSUP`; coalitions lack kill-all-now; Endpoint Security is observation, not containment. `procd` fails closed and does not fake it. |
 
@@ -92,13 +102,14 @@ procd run [--require-enforced] -- <cmd> [args...]
   `PROCD_REQUIRE_ENFORCED=1` for the test binaries) turns every skip into a
   failure.
 - **Negative controls**
-  ([`tests/negative_control_test.c`](tests/negative_control_test.c)) — for every
-  `ENFORCED` claim, a test-only weakened boundary demonstrates the *same*
-  adversary **escaping** and surviving termination (the migration attempt and
-  its outcome are witnessed), proving the harness can
-  observe the failure it claims to prevent; the production boundary then
-  prevents the escape. Production containment can never be weakened — the
-  weakening switch only compiles into a separate test library.
+  ([`tests/negative_control_test.c`](tests/negative_control_test.c)) — a
+  test-only weakened supervision demonstrates the *same* workload surviving
+  termination, proving the harness can observe the failure the production
+  mechanism prevents. On Linux the weakening is process-group termination and
+  the workload detaches a descendant with `setsid` or a double fork (ordinary
+  topology changes); production cgroup termination removes the same topology.
+  On Windows it is a Job that permits breakaway. Production supervision can
+  never be weakened — the switch only compiles into a separate test library.
 - **macOS escape demonstration**
   ([`tests/macos_escape_test.c`](tests/macos_escape_test.c)) — actively shows a
   double-forked descendant surviving `killpg`, the evidence behind
@@ -132,11 +143,13 @@ GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
   explicitly unclaimed escape probes may remain `INCONCLUSIVE`. Green means the
   `BEST_EFFORT` model behaved as reported, not that Windows is `ENFORCED`.
 - **linux-enforced-qualification** — the only job whose green means Linux
-  `ENFORCED` was demonstrated. It runs in a privileged container with a private
-  cgroup namespace, asserts every prerequisite and the reported capability
-  level up front, checks that `/bin/true` and a non-executable adversary do
-  **not** qualify, then requires every adversarial scenario, the negative
-  control, and the recovery regression to pass with no skips.
+  `ENFORCED` lifecycle grouping was demonstrated. In a privileged container with
+  a private cgroup namespace it asserts the prerequisites and reported level,
+  checks that `/bin/true` and a non-executable adversary do **not** qualify,
+  and requires every topology scenario, the negative control and the full
+  suite (including root-only recovery/establishment tests) to pass with no
+  skips; it then repeats the lifecycle suite as an ordinary unprivileged user
+  in a delegated cgroup-v2 subtree.
 
 ## License
 
