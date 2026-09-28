@@ -50,8 +50,8 @@ int main(int argc, char **argv) {
     si.cb = sizeof si;
     PROCESS_INFORMATION cpi;
     ZeroMemory(&cpi, sizeof cpi);
-    BOOL have_ctrl = CreateProcessA(NULL, (LPSTR) "cmd /c ping -n 600 127.0.0.1 >NUL", NULL, NULL,
-                                    FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &cpi);
+    BOOL have_ctrl = CreateProcessA(NULL, (LPSTR) "ping.exe -n 600 127.0.0.1", NULL, NULL, FALSE,
+                                    CREATE_NO_WINDOW, NULL, NULL, &si, &cpi);
 #else
     pid_t ctrl = fork();
     if (ctrl == 0) {

@@ -290,7 +290,7 @@ static void case_ordinary(const char *adv, const char *dir) {
 
     procd_domain_status status;
     int status_ok = domain && procd_domain_status_get(domain, &status) == PROCD_OK &&
-                    status.population == PROCD_POP_POPULATED && !status.population_is_authoritative;
+                    status.population == PROCD_POP_POPULATED && status.population_is_authoritative;
     procd_termination_evidence ev;
     int honest = domain && terminate_honestly(domain, &ev);
     int descendants_dead =

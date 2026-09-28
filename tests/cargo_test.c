@@ -1,6 +1,6 @@
 #if !defined(_WIN32)
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700 /* realpath */
 #endif
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE 1
@@ -447,7 +447,7 @@ static void task_observe(task *t) {
         p = up;
     }
     if (!reached || !saw_cargo) {
-        snprintf(t->why, sizeof t->why, "no kernel chain spawned-shell -> cargo -> %s: [%s]",
+        snprintf(t->why, sizeof t->why, "no kernel chain spawned-shell -> cargo -> %s: [%.180s]",
                  roles[0], chain);
         return;
     }
@@ -468,7 +468,7 @@ static void task_observe(task *t) {
             if (t->ids.n != before) grew = 1;
         }
     }
-    snprintf(t->why, sizeof t->why, "[%s], %d live task processes", chain, t->ids.n);
+    snprintf(t->why, sizeof t->why, "[%.200s], %d live task processes", chain, t->ids.n);
     t->observed = 1;
 }
 
@@ -521,7 +521,7 @@ static int control_start(control *c) {
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si);
     si.cb = sizeof si;
-    if (!CreateProcessA(NULL, (LPSTR) "cmd.exe /d /c ping -n 900 127.0.0.1 >NUL", NULL, NULL, FALSE,
+    if (!CreateProcessA(NULL, (LPSTR) "ping.exe -n 900 127.0.0.1", NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return 0;
     CloseHandle(pi.hThread);
