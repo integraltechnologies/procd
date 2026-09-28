@@ -388,7 +388,8 @@ static void run_start(run *x, const char *adv, const char *mode) {
         return;
     }
     static w_rec w[W_MAX];
-    for (int i = 0; i < 300 && !x->pre; i++) {
+    /* wall-clock bound: macOS timer coalescing can stretch short sleeps */
+    for (long long end = mono_ms() + 6000; !x->pre && mono_ms() < end;) {
         nap_ms(20);
         int n = w_read(x->wd, w, W_MAX);
         x->pre = precondition(mode, (long)x->pid, w, n, x->why, sizeof x->why);
@@ -643,7 +644,7 @@ static void isolation(q_case *c, const char *adv) {
     run_start(&b, adv, "grandchild");
     int ustarted = unrelated_start(&u, adv, "grandchild");
     int ucount = 0;
-    for (int i = 0; i < 250 && ustarted; i++) {
+    for (long long end = mono_ms() + 5000; ustarted && mono_ms() < end;) {
         static w_rec w[W_MAX];
         char why[160];
         int n = w_read(u.wd, w, W_MAX);

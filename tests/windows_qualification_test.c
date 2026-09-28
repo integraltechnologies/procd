@@ -358,7 +358,10 @@ static void case_churn(const char *adv, const char *dir) {
     int survivors = 0;
     for (int i = 0; i < n; i++)
         survivors += !dead_within(members[i].process, 3000);
+    /* every churn member ever witnessed, including ones created while the
+     * kill was in progress; each gets the same bounded rundown wait */
     int witnessed_total = 0, post_survivors = 0;
+    unsigned long survivor_pid = 0;
     for (int i = 0; i < 256; i++) {
         char role[64];
         record later = {0};
@@ -367,7 +370,10 @@ static void case_churn(const char *adv, const char *dir) {
         witnessed_total++;
         HANDLE exact = NULL;
         if (open_identity(later.pid, later.created, &exact)) {
-            post_survivors += alive(exact);
+            if (!dead_within(exact, 3000)) {
+                post_survivors++;
+                survivor_pid = later.pid;
+            }
             CloseHandle(exact);
         }
     }
@@ -378,8 +384,8 @@ static void case_churn(const char *adv, const char *dir) {
     char detail[256];
     snprintf(detail, sizeof detail,
              "%d live members before kill; %d total witnessed; %d sampled/%d post-kill "
-             "survivors; bounded=%d",
-             n, witnessed_total, survivors, post_survivors, bounded);
+             "survivors (last %lu); bounded=%d",
+             n, witnessed_total, survivors, post_survivors, survivor_pid, bounded);
     required_result("termination during spawn/churn", ok, detail);
     if (root.process) CloseHandle(root.process);
     for (int i = 0; i < n; i++)

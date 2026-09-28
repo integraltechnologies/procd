@@ -105,7 +105,8 @@ procd run [--require-enforced] -- <cmd> [args...]
   Linux, macOS and Windows — bounded fixtures for: direct child, grandchild,
   leader exit with a live descendant, shell background job whose shell exits,
   four children each with a grandchild, rapid churn racing termination, a
-  timeout-style teardown, 10 repeated create/spawn/terminate cycles, a failed
+  task that already finished (must read as not populated and clean up within
+  1s), a timeout-style teardown, 10 repeated create/spawn/terminate cycles, a failed
   spawn next to a running task, and two concurrent tasks plus an unrelated
   same-user tree (terminating one task touches nothing else). Unix adds `exec`,
   `setsid`, `setpgid`, double fork, reparenting and environment-cleared
