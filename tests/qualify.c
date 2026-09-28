@@ -521,12 +521,19 @@ static void finished_task(q_case *c, const char *adv) {
         run_release(&x);
         return;
     }
+    /* the exiting process may still be in rundown and counted by the OS for a
+     * moment after it is observed to have exited: allow it to settle */
+    procd_domain_status st;
+    for (long long end = mono_ms() + 1000; mono_ms() < end; nap_ms(10))
+        if (procd_domain_status_get(x.d, &st) == PROCD_OK && st.population != PROCD_POP_POPULATED)
+            break;
     outcome o;
     run_finish(&x, TERM_TIMEOUT_MS, &o);
     judge(c, &x, &o);
     if (c->result == Q_PASS && o.pre_pop == PROCD_POP_POPULATED) {
         c->result = Q_FAIL;
-        snprintf(c->detail, sizeof c->detail, "status POPULATED although the task had finished");
+        snprintf(c->detail, sizeof c->detail,
+                 "status still POPULATED 1s after the task had finished");
     } else if (c->result == Q_PASS && o.term_ms > 1000) {
         c->result = Q_FAIL;
         snprintf(c->detail, sizeof c->detail, "cleanup of a finished task took %lldms", o.term_ms);
