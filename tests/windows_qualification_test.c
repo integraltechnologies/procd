@@ -281,12 +281,15 @@ static void case_ordinary(const char *adv, const char *dir) {
     int observed = wait_record(dir, "root", &root, 4000) &&
                    wait_record(dir, "child", &child, 4000) &&
                    wait_record(dir, "grandchild", &grandchild, 4000);
-    int opened =
-        observed && attach_record(&root) && attach_record(&child) && attach_record(&grandchild);
+    /* the leader exits at once; procd holds no handle to it, so once it is gone
+     * its exact identity may no longer be openable: that is exit evidence too */
+    int root_open = observed && attach_record(&root);
+    int opened = observed && attach_record(&child) && attach_record(&grandchild);
+    int root_exited = observed && (!root_open || dead_within(root.process, 3000));
     int topology = opened && rc == PROCD_OK && root.pid == (DWORD)spawned &&
                    child.creator == root.pid && grandchild.creator == child.pid && root.in_job &&
-                   child.in_job && grandchild.in_job && dead_within(root.process, 3000) &&
-                   alive(child.process) && alive(grandchild.process);
+                   child.in_job && grandchild.in_job && root_exited && alive(child.process) &&
+                   alive(grandchild.process);
 
     procd_domain_status status;
     memset(&status, 0, sizeof status);
@@ -302,7 +305,7 @@ static void case_ordinary(const char *adv, const char *dir) {
              "descendants_live=%d status=%d(pop %d auth %d) honest=%d dead=%d",
              observed, opened, procd_status_name(rc), root.pid == (DWORD)spawned,
              child.creator == root.pid, grandchild.creator == child.pid, root.in_job, child.in_job,
-             grandchild.in_job, opened && !alive(root.process),
+             grandchild.in_job, root_exited,
              opened && alive(child.process) && alive(grandchild.process), status_ok,
              (int)status.population, status.population_is_authoritative, honest, descendants_dead);
     int ok = topology && status_ok && honest && descendants_dead;

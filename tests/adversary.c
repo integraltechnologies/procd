@@ -409,6 +409,7 @@ static int run_posix(const char *mode) {
         _exit(0);
     }
     w_write("root");
+    if (strcmp(mode, "exit") == 0) return 0; /* a task that simply finished */
     if (strcmp(mode, "child") == 0) {
         if (fork() == 0) live("child");
     } else if (strcmp(mode, "grandchild") == 0) {
@@ -604,6 +605,8 @@ int main(int argc, char **argv) {
                 write_breakaway_outcome("creation-failed", NULL, requested_error);
             }
         }
+    } else if (strcmp(mode, "exit") == 0) {
+        return 0; /* a task that simply finished */
     } else if (strcmp(mode, "child") == 0) {
         spawn_cmd("wleaf child", 0);
     } else if (strcmp(mode, "grandchild") == 0) {

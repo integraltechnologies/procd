@@ -218,7 +218,9 @@ static int precondition(const char *mode, long spawned, const w_rec *w, int n, c
     const w_rec *r = w_find(w, n, "root");
     NEED(r, "workload never executed (no root witness)");
     NEED(spawned <= 0 || r->pid == spawned, "root witness is not the spawned process");
-    if (!strcmp(mode, "child")) {
+    if (!strcmp(mode, "exit")) {
+        NEED(!w_alive(r), "finished task still running");
+    } else if (!strcmp(mode, "child")) {
         const w_rec *c = w_find(w, n, "child");
         NEED(c && c->pid != r->pid && c->ppid == r->pid, "no child of the root witnessed");
         NEED(w_live(r) && w_live(c), "root/child not running as witnessed");
@@ -347,6 +349,7 @@ typedef struct {
     int64_t pid;
     int pre;
     char why[160];
+    int finished;    /* the workload is expected to have exited already */
     int skip;        /* prerequisite unavailable */
     procd_status rc; /* create/spawn status */
 } run;
@@ -354,6 +357,7 @@ typedef struct {
 /* Create a domain, spawn `mode`, and wait (bounded) for its topology. */
 static void run_start(run *x, const char *adv, const char *mode) {
     memset(x, 0, sizeof *x);
+    x->finished = !strcmp(mode, "exit");
     procd_policy pol;
     domain_policy(&pol);
     x->rc = procd_create_domain(&pol, &x->d);
@@ -393,6 +397,7 @@ static void run_start(run *x, const char *adv, const char *mode) {
 
 typedef struct {
     int witnessed, alive, status_lied, oracle_valid, bound_ok, post_status_ok;
+    procd_population pre_pop;
     long long term_ms;
     procd_status rc;
     procd_termination_evidence ev;
@@ -406,8 +411,9 @@ static void run_finish(run *x, int timeout_ms, outcome *o) {
     procd_domain_status st;
     if (procd_domain_status_get(x->d, &st) == PROCD_OK) {
         o->level = st.process_tree_termination;
+        o->pre_pop = st.population;
         /* a witnessed task process is running: "empty" here would be a lie */
-        o->status_lied = x->pre && st.population == PROCD_POP_EMPTY;
+        o->status_lied = x->pre && !x->finished && st.population == PROCD_POP_EMPTY;
     }
     long long t = mono_ms();
     o->rc = procd_domain_terminate(x->d, timeout_ms, &o->ev);
@@ -441,7 +447,10 @@ static void judge(q_case *c, const run *x, const outcome *o) {
     size_t dn = sizeof c->detail;
     if (!x->pre) {
         c->result = Q_SKIP;
-        snprintf(d, dn, "PRECONDITION NOT OBSERVED (%s): scenario not exercised", x->why);
+        snprintf(d, dn,
+                 "PRECONDITION NOT OBSERVED (%.100s): scenario not exercised [terminate %s in "
+                 "%lldms: %.60s]",
+                 x->why, procd_status_name(o->rc), o->term_ms, o->ev.detail ? o->ev.detail : "");
     } else if (!o->oracle_valid) {
         c->result = Q_SKIP;
         snprintf(d, dn, "ORACLE INCONCLUSIVE: too close to the fixture lifetime");
@@ -496,6 +505,31 @@ static void scenario(q_case *c, const char *adv, const char *mode, int timeout_m
     outcome o;
     run_finish(&x, timeout_ms, &o);
     judge(c, &x, &o);
+    run_release(&x);
+}
+
+/* A task that already finished: status must say so and cleanup must be quick
+ * (agentctl terminates every task, including ones that completed normally). */
+static void finished_task(q_case *c, const char *adv) {
+    c->adversarial = 1;
+    run x;
+    run_start(&x, adv, "exit");
+    if (!x.d || x.rc != PROCD_OK || x.skip) {
+        c->result = x.skip ? Q_SKIP : Q_FAIL;
+        snprintf(c->detail, sizeof c->detail, "%s", x.why);
+        run_release(&x);
+        return;
+    }
+    outcome o;
+    run_finish(&x, TERM_TIMEOUT_MS, &o);
+    judge(c, &x, &o);
+    if (c->result == Q_PASS && o.pre_pop == PROCD_POP_POPULATED) {
+        c->result = Q_FAIL;
+        snprintf(c->detail, sizeof c->detail, "status POPULATED although the task had finished");
+    } else if (c->result == Q_PASS && o.term_ms > 1000) {
+        c->result = Q_FAIL;
+        snprintf(c->detail, sizeof c->detail, "cleanup of a finished task took %lldms", o.term_ms);
+    }
     run_release(&x);
 }
 
@@ -738,6 +772,9 @@ int procd_qualify_run(const char *adv, q_case *out, int max, int *n) {
 
     /* Timeout-style cancellation: the task runs to its deadline, then is torn
      * down with a short termination budget. */
+    q_case *fin = emit(out, max, n, "finished-task");
+    if (fin) finished_task(fin, adv);
+
     q_case *to = emit(out, max, n, "timeout");
     if (to) scenario(to, adv, "multi", 3000, 1000);
 

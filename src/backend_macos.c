@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -321,8 +322,10 @@ static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t 
         envp[i] = environ[i];
     envp[ne] = im->marker;
 
+    /* go channel: a socketpair whose parent end never raises SIGPIPE in the
+     * host process if the child has already died */
     int go[2], st[2];
-    if (pipe(go) != 0) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, go) != 0) {
         free(envp);
         return PROCD_E_IO;
     }
@@ -336,6 +339,8 @@ static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t 
         fcntl(go[i], F_SETFD, FD_CLOEXEC);
         fcntl(st[i], F_SETFD, FD_CLOEXEC);
     }
+    int one = 1;
+    setsockopt(go[1], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
     pid_t pid = fork();
     if (pid < 0) {
         close(go[0]), close(go[1]), close(st[0]), close(st[1]);
