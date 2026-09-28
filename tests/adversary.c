@@ -410,6 +410,17 @@ static int run_posix(const char *mode) {
         }
         _exit(0);
     }
+    if (strcmp(mode, "storm-middle") == 0) {
+        /* one escape attempt: env-less, new session, double fork, reparent */
+        w_write("storm-mid");
+        setsid();
+        pid_t mid = getpid();
+        if (fork() == 0) {
+            await_reparent(mid);
+            live("storm-escapee"); /* witnessed only once the topology is complete */
+        }
+        _exit(0);
+    }
     w_write("root");
     if (strcmp(mode, "exit") == 0) return 0; /* a task that simply finished */
     if (strcmp(mode, "child") == 0) {
@@ -487,6 +498,19 @@ static int run_posix(const char *mode) {
         pid_t p = fork();
         if (p == 0) exec_clean("clean-daemon");
         waitpid(p, NULL, 0);
+    } else if (strcmp(mode, "escape-storm") == 0) {
+        /* repeated env-clear-daemon attempts (PROCD_ADV_STORM, default 24,
+         * PROCD_ADV_STORM_GAP_MS apart), each reaped at once as a shell would,
+         * so termination races attempts that are still in flight */
+        const char *s = getenv("PROCD_ADV_STORM"), *g = getenv("PROCD_ADV_STORM_GAP_MS");
+        int k = s ? atoi(s) : 24, gap = g ? atoi(g) : 2;
+        if (k <= 0 || k > 60) k = 24;
+        for (int i = 0; i < k; i++) {
+            pid_t p = fork();
+            if (p == 0) exec_clean("storm-middle");
+            waitpid(p, NULL, 0);
+            if (gap > 0) nap_ms(gap);
+        }
     } else if (strcmp(mode, "churn") == 0) {
         /* keep forking for the whole bounded lifetime, so forks race with
          * termination; the first 64 children witness themselves */
@@ -736,7 +760,8 @@ int main(int argc, char **argv) {
     g_self = argv[0];
     if (!realpath(argv[0], g_self_path)) snprintf(g_self_path, sizeof g_self_path, "%s", argv[0]);
 #endif
-    if (!strcmp(mode, "clean-parent") || !strcmp(mode, "clean-daemon")) {
+    if (!strcmp(mode, "clean-parent") || !strcmp(mode, "clean-daemon") ||
+        !strcmp(mode, "storm-middle")) {
         /* started with an empty environment: restore only what the fixture
          * itself needs, in-process (the kernel-visible exec env stays empty) */
         if (argc > 3) {
