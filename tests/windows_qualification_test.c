@@ -289,18 +289,27 @@ static void case_ordinary(const char *adv, const char *dir) {
                    alive(child.process) && alive(grandchild.process);
 
     procd_domain_status status;
+    memset(&status, 0, sizeof status);
     int status_ok = domain && procd_domain_status_get(domain, &status) == PROCD_OK &&
                     status.population == PROCD_POP_POPULATED && status.population_is_authoritative;
     procd_termination_evidence ev;
     int honest = domain && terminate_honestly(domain, &ev);
     int descendants_dead =
         opened && dead_within(child.process, 3000) && dead_within(grandchild.process, 3000);
-    required_result(
-        "ordinary descendant containment", topology && status_ok && honest && descendants_dead,
-        topology && status_ok && honest && descendants_dead
-            ? "child+grandchild remained after leader exit, were Job-observed, and died "
-              "with the Job; exec replacement is not a Windows primitive"
-            : "topology/witness/status/termination check failed");
+    char detail[256];
+    snprintf(detail, sizeof detail,
+             "observed=%d opened=%d rc=%s spawned=%d chain=%d/%d in_job=%d%d%d root_exited=%d "
+             "descendants_live=%d status=%d(pop %d auth %d) honest=%d dead=%d",
+             observed, opened, procd_status_name(rc), root.pid == (DWORD)spawned,
+             child.creator == root.pid, grandchild.creator == child.pid, root.in_job, child.in_job,
+             grandchild.in_job, opened && !alive(root.process),
+             opened && alive(child.process) && alive(grandchild.process), status_ok,
+             (int)status.population, status.population_is_authoritative, honest, descendants_dead);
+    int ok = topology && status_ok && honest && descendants_dead;
+    required_result("ordinary descendant containment", ok,
+                    ok ? "child+grandchild remained after leader exit, were Job-observed, and "
+                         "died with the Job; exec replacement is not a Windows primitive"
+                       : detail);
 
     if (root.process) CloseHandle(root.process);
     if (child.process) CloseHandle(child.process);

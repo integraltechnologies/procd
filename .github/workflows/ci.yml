@@ -52,6 +52,7 @@ jobs:
   # separately and never counted as passes.
   windows-native-qualification:
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
@@ -141,6 +142,7 @@ jobs:
   # kernel domain. The documented residual is printed, never counted.
   macos-native-qualification:
     runs-on: macos-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
@@ -159,6 +161,7 @@ jobs:
           build/procd capabilities | tee caps.txt
           grep -qx "ProcessTreeTermination:     BEST_EFFORT" caps.txt
       - name: shared lifecycle matrix (every scenario must clean up)
+        timeout-minutes: 10
         run: |
           PROCD_REQUIRE_CLEANUP=1 build/procd-qualify-test build/procd-adversary | tee macos-lifecycle.log
           grep -q "PRACTICAL cleanup qualification: PASS" macos-lifecycle.log
@@ -201,6 +204,7 @@ jobs:
   # the configuration agentctl normally runs in.
   linux-enforced-qualification:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: ENFORCED qualification in privileged container

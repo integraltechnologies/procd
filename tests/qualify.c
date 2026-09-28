@@ -94,7 +94,13 @@ int procd_qualify_require_cleanup(void) {
     return v && strcmp(v, "1") == 0;
 }
 
+/* progress on stderr, so a stuck scenario is visible while the matrix runs */
+static void progress(const q_case *c) {
+    if (c) fprintf(stderr, "  ... %-18s %s\n", c->name, q_result_name(c->result));
+}
+
 static q_case *emit(q_case *out, int max, int *n, const char *name) {
+    if (*n > 0) progress(&out[*n - 1]);
     if (*n >= max) return NULL;
     q_case *c = &out[*n];
     (*n)++;
@@ -769,6 +775,7 @@ int procd_qualify_run(const char *adv, q_case *out, int max, int *n) {
         }
     }
 
+    if (*n > 0) progress(&out[*n - 1]);
     int fails = 0;
     for (int i = 0; i < *n; i++)
         if (out[i].result == Q_FAIL) fails++;
