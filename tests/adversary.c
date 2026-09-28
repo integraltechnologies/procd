@@ -28,6 +28,7 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#include "witness.h"
 #include <stdint.h>
 #include <windows.h>
 static void adv_sleep(int secs) {
@@ -129,6 +130,22 @@ static int spawn_self(const char *mode, const char *arg, DWORD flags, HANDLE par
     DeleteProcThreadAttributeList(attrs);
     HeapFree(GetProcessHeap(), 0, attrs);
     return ok;
+}
+
+/* launch `"<self>" <tail>` with ordinary CreateProcess and `flags`; closes handles */
+static int spawn_cmd(const char *tail, DWORD flags) {
+    char self[MAX_PATH], cmd[MAX_PATH * 3];
+    self_path(self, sizeof self);
+    snprintf(cmd, sizeof cmd, "\"%s\" %s", self, tail);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof si);
+    si.cb = sizeof si;
+    if (!(flags & DETACHED_PROCESS)) flags |= CREATE_NO_WINDOW;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, flags, NULL, NULL, &si, &pi)) return 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
 }
 
 static int duplicate_controller_job(DWORD controller_pid, DWORD *error_out) {
@@ -342,9 +359,11 @@ static void nap_ms(int ms) {
     struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
     nanosleep(&t, NULL);
 }
-/* bounded wait until our parent is no longer `orig` (we were reparented) */
+/* bounded (wall-clock, not iterations: macOS coalesces short sleeps) wait
+ * until our parent is no longer `orig` (we were reparented) */
 static void await_reparent(pid_t orig) {
-    for (int i = 0; i < 400 && getppid() == orig; i++)
+    time_t end = time(NULL) + 5;
+    while (getppid() == orig && time(NULL) <= end)
         nap_ms(5);
 }
 /* witness `role`, then live out the bounded lifetime */
@@ -354,10 +373,45 @@ static void live(const char *role) {
     _exit(0);
 }
 
+static char g_self_path[1024]; /* absolute path of this binary (for sh / re-exec) */
+
+/* re-exec this binary as `mode` with an EMPTY environment (like `env -i`) */
+static void exec_clean(const char *mode) {
+    /* the witness dir and lifetime travel in argv, not the environment */
+    const char *wd = getenv(W_ENV);
+    char t[16];
+    snprintf(t, sizeof t, "%d", ttl());
+    char *const av[] = {g_self_path, (char *)mode, (char *)(wd ? wd : ""), t, NULL};
+    char *const ev[] = {NULL};
+    execve(g_self_path, av, ev);
+    _exit(127);
+}
+
 static int run_posix(const char *mode) {
     int T = ttl();
     if (strcmp(mode, "exec-post") == 0) live("exec-post"); /* new image after exec */
+    if (strcmp(mode, "bg-leaf") == 0) {
+        /* backgrounded by a shell that then exits: witness once reparented */
+        await_reparent(getppid());
+        live("bg");
+    }
+    if (strcmp(mode, "clean-parent") == 0) {
+        /* env-less child that stays attached and forks a grandchild */
+        if (fork() == 0) live("clean-grandchild");
+        live("clean-child");
+    }
+    if (strcmp(mode, "clean-daemon") == 0) {
+        /* env-less daemon: new session + double fork + reparent */
+        setsid();
+        pid_t mid = getpid();
+        if (fork() == 0) {
+            await_reparent(mid);
+            live("clean-daemon");
+        }
+        _exit(0);
+    }
     w_write("root");
+    if (strcmp(mode, "exit") == 0) return 0; /* a task that simply finished */
     if (strcmp(mode, "child") == 0) {
         if (fork() == 0) live("child");
     } else if (strcmp(mode, "grandchild") == 0) {
@@ -415,6 +469,24 @@ static int run_posix(const char *mode) {
             live("orphan"); /* descendant keeps running */
         }
         _exit(0); /* leader exits immediately */
+    } else if (strcmp(mode, "background") == 0) {
+        /* ordinary shell background job whose shell exits at once */
+        execl("/bin/sh", "sh", "-c", "\"$0\" bg-leaf & exit 0", g_self_path, (char *)NULL);
+        _exit(127);
+    } else if (strcmp(mode, "multi") == 0) {
+        for (int i = 0; i < 4; i++)
+            if (fork() == 0) {
+                if (fork() == 0) live("multi-grandchild");
+                live("multi-child");
+            }
+    } else if (strcmp(mode, "env-clear") == 0) {
+        /* a descendant that drops its whole environment but stays in the tree */
+        if (fork() == 0) exec_clean("clean-parent");
+    } else if (strcmp(mode, "env-clear-daemon") == 0) {
+        /* env -i + setsid + double fork: leaves the tree AND the environment */
+        pid_t p = fork();
+        if (p == 0) exec_clean("clean-daemon");
+        waitpid(p, NULL, 0);
     } else if (strcmp(mode, "churn") == 0) {
         /* keep forking for the whole bounded lifetime, so forks race with
          * termination; the first 64 children witness themselves */
@@ -468,6 +540,22 @@ int main(int argc, char **argv) {
             }
         }
         win_witness((argc > 3) ? argv[3] : "leaf", creator, 0);
+        if (argc > 3 && strncmp(argv[3], "churn-", 6) == 0) w_write("churn");
+        adv_sleep(ttl());
+        return 0;
+    }
+    if (strcmp(mode, "wleaf") == 0 && argc > 2) {
+        w_write(argv[2]);
+        adv_sleep(ttl());
+        return 0;
+    }
+    if (strcmp(mode, "wmid") == 0 && argc > 5) {
+        /* wmid <role> <child-role> <creation-flags> stay|exit */
+        char tail[128];
+        snprintf(tail, sizeof tail, "wleaf %s", argv[3]);
+        int ok = spawn_cmd(tail, (DWORD)strtoul(argv[4], NULL, 0));
+        if (ok) w_write(argv[2]); /* witness only once the descendant exists */
+        if (strcmp(argv[5], "exit") == 0) return ok ? 0 : 1;
         adv_sleep(ttl());
         return 0;
     }
@@ -482,20 +570,21 @@ int main(int argc, char **argv) {
         char parent[32];
         win_witness("child", creator, 0);
         snprintf(parent, sizeof parent, "%lu", (unsigned long)GetCurrentProcessId());
-        if (spawn_self("grandchild", parent, 0, NULL, &child_pi)) {
+        if (spawn_self("ordinary-grandchild", parent, 0, NULL, &child_pi)) {
             CloseHandle(child_pi.hThread);
             CloseHandle(child_pi.hProcess);
         }
         adv_sleep(ttl());
         return 0;
     }
-    if (strcmp(mode, "grandchild") == 0) {
+    if (strcmp(mode, "ordinary-grandchild") == 0) {
         win_witness("grandchild", creator, 0);
         adv_sleep(ttl());
         return 0;
     }
 
     win_witness("root", 0, 0);
+    w_write("root");
     win_witness("job-handle-scan", 0, own_job_handle_count());
     check_sentinel();
     printf("ADV_ROOT %lu\n", (unsigned long)GetCurrentProcessId());
@@ -518,6 +607,44 @@ int main(int argc, char **argv) {
                 write_breakaway_outcome("creation-failed", NULL, requested_error);
             }
         }
+    } else if (strcmp(mode, "exit") == 0) {
+        return 0; /* a task that simply finished */
+    } else if (strcmp(mode, "child") == 0) {
+        spawn_cmd("wleaf child", 0);
+    } else if (strcmp(mode, "grandchild") == 0) {
+        spawn_cmd("wmid child grandchild 0 stay", 0);
+    } else if (strcmp(mode, "leader-exit") == 0) {
+        spawn_cmd("wleaf orphan", 0);
+        return 0; /* leader exits while its descendant keeps running */
+    } else if (strcmp(mode, "multi") == 0) {
+        for (int i = 0; i < 4; i++)
+            spawn_cmd("wmid multi-child multi-grandchild 0 stay", 0);
+    } else if (strcmp(mode, "background") == 0) {
+        /* cmd.exe background job (`start /b`); cmd exits at once */
+        char self[MAX_PATH], cmd[MAX_PATH * 3];
+        self_path(self, sizeof self);
+        snprintf(cmd, sizeof cmd, "cmd.exe /d /c start \"\" /b \"%s\" wleaf bg", self);
+        STARTUPINFOA si;
+        ZeroMemory(&si, sizeof si);
+        si.cb = sizeof si;
+        if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    } else if (strcmp(mode, "detached") == 0) {
+        /* Windows analogue of setsid: no console, new process group */
+        spawn_cmd("wleaf detached", DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    } else if (strcmp(mode, "double-fork") == 0) {
+        /* detached middle launches a detached grandchild and exits */
+        char tail[128];
+        snprintf(tail, sizeof tail, "wmid df-middle df-grandchild %lu exit",
+                 (unsigned long)(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP));
+        spawn_cmd(tail, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    } else if (strcmp(mode, "breakaway-request") == 0) {
+        /* an ordinary tool asking for CREATE_BREAKAWAY_FROM_JOB; falls back
+         * to a normal launch when the Job refuses, as real launchers do */
+        if (!spawn_cmd("wleaf breakaway", CREATE_BREAKAWAY_FROM_JOB))
+            spawn_cmd("wleaf breakaway-fallback", 0);
     } else if (strcmp(mode, "preexec") == 0) {
         /* The root witness is intentionally the first fixture action. */
     } else if (strcmp(mode, "ordinary") == 0) {
@@ -603,9 +730,22 @@ int main(int argc, char **argv) {
     }
 #if defined(__linux__)
     g_self = "/proc/self/exe";
+    ssize_t sl = readlink("/proc/self/exe", g_self_path, sizeof g_self_path - 1);
+    if (sl > 0) g_self_path[sl] = 0;
 #else
     g_self = argv[0];
+    if (!realpath(argv[0], g_self_path)) snprintf(g_self_path, sizeof g_self_path, "%s", argv[0]);
 #endif
+    if (!strcmp(mode, "clean-parent") || !strcmp(mode, "clean-daemon")) {
+        /* started with an empty environment: restore only what the fixture
+         * itself needs, in-process (the kernel-visible exec env stays empty) */
+        if (argc > 3) {
+            if (argv[2][0]) setenv(W_ENV, argv[2], 1);
+            setenv("PROCD_ADV_TTL", argv[3], 1);
+        }
+        return run_posix(mode);
+    }
+    if (!strcmp(mode, "bg-leaf")) return run_posix(mode);
     printf("ADV_ROOT %d\n", (int)getpid());
     fflush(stdout);
     return run_posix(mode);

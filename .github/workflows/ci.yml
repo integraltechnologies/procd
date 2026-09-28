@@ -22,10 +22,9 @@ jobs:
 
   # PORTABILITY (native, per OS). Green means: the code builds natively on this
   # OS and every test either passed or skipped for a stated, genuine reason
-  # (e.g. an unprivileged runner has no cgroup authority, or the backend
-  # truthfully does not claim the guarantee). It is NOT evidence of ENFORCED
-  # ProcessTreeTermination on any platform. No failure is swallowed. Nothing is
-  # cross-compiled; each OS is built and run natively on its own runner.
+  # (e.g. an unprivileged Linux runner has no cgroup authority). The per-OS
+  # native qualification jobs below are the lifecycle evidence. No failure is
+  # swallowed. Nothing is cross-compiled.
   portability:
     strategy:
       fail-fast: false
@@ -41,25 +40,51 @@ jobs:
       - name: test
         run: ctest --test-dir build --output-on-failure --no-tests=error -C Release
 
-  # WINDOWS NATIVE QUALIFICATION. Green means the reported BEST_EFFORT model
-  # and its claimed mechanism-level properties were exercised on Windows. It
-  # does not mean ProcessTreeTermination is ENFORCED. Required properties have
-  # no skip path; known escape probes may say INCONCLUSIVE, never PASS, when
-  # stock-runner permissions or services prevent a deterministic reproduction.
+  # WINDOWS NATIVE QUALIFICATION. Green means, on a native Windows runner: the
+  # shared lifecycle matrix PASSED every ordinary-topology scenario with
+  # witnessed topology and zero survivors (PROCD_REQUIRE_CLEANUP=1); the Job
+  # mechanism claims behind ENFORCED held (suspended pre-exec admission, handle
+  # non-inheritance, proven emptiness, supervisor loss kills the task); the
+  # breakaway negative control was detected; and a real Cargo workload
+  # (cmd -> cargo -> rustc / build script / test -> descendants) was cleaned up
+  # repeatedly without touching a concurrent Cargo task. Out-of-contract escape
+  # probes (parent-process attribute, Job-handle duplication, WMI) are reported
+  # separately and never counted as passes.
   windows-native-qualification:
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      - name: toolchain
+        shell: pwsh
+        run: |
+          cargo --version
+          rustc --version
       - name: configure (MSVC warnings are errors)
         run: cmake -S . -B build-win-qual -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="/WX"
       - name: build native qualification binaries
         run: cmake --build build-win-qual --config Release
+      - name: capabilities
+        shell: pwsh
+        run: '& .\build-win-qual\Release\procd.exe capabilities'
       - name: portable contract unit suite
         shell: pwsh
         run: |
           & .\build-win-qual\Release\procd-unit-test.exe 2>&1 | Tee-Object -FilePath windows-unit.log
           if ($LASTEXITCODE -ne 0) { throw "portable unit suite failed: $LASTEXITCODE" }
-      - name: Windows Job mechanism and limitation qualification
+      - name: shared lifecycle matrix (every scenario must clean up)
+        shell: pwsh
+        run: |
+          $env:PROCD_REQUIRE_CLEANUP = "1"
+          & .\build-win-qual\Release\procd-qualify-test.exe `
+            .\build-win-qual\Release\procd-adversary.exe 2>&1 | `
+            Tee-Object -FilePath windows-lifecycle.log
+          if ($LASTEXITCODE -ne 0) { throw "lifecycle matrix failed: $LASTEXITCODE" }
+          if (-not (Select-String -Path windows-lifecycle.log -Quiet `
+                  -SimpleMatch "PRACTICAL cleanup qualification: PASS")) {
+            throw "practical cleanup verdict missing"
+          }
+      - name: Windows Job mechanism qualification
         shell: pwsh
         run: |
           & .\build-win-qual\Release\procd-windows-qualification-test.exe `
@@ -85,15 +110,87 @@ jobs:
                   -SimpleMatch "PASS: harness detects breakaway escape; production Job prevents it")) {
             throw "negative-control production comparison missing"
           }
+      - name: real Cargo workload lifecycle
+        shell: pwsh
+        run: |
+          $env:PROCD_REQUIRE_CARGO = "1"
+          New-Item -ItemType Directory -Force cargo-scratch | Out-Null
+          & .\build-win-qual\Release\procd-cargo-test.exe `
+            tests\cargo_fixture\Cargo.toml cargo-scratch 2>&1 | `
+            Tee-Object -FilePath windows-cargo.log
+          if ($LASTEXITCODE -ne 0) { throw "Cargo lifecycle failed: $LASTEXITCODE" }
+      - name: full native suite
+        run: ctest --test-dir build-win-qual --output-on-failure --no-tests=error -C Release
       - name: publish qualification logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-native-qualification-logs
           path: |
-            windows-unit.log
-            windows-qualification.log
-            windows-negative-control.log
+            windows-*.log
+          if-no-files-found: warn
+
+  # MACOS NATIVE QUALIFICATION. Green means, on a native macOS runner as an
+  # ordinary user: the shared lifecycle matrix PASSED every ordinary-topology
+  # scenario (child, grandchild, exec, setsid, setpgid, double-fork, reparent,
+  # leader exit, shell background job, env-cleared descendants, churn, timeout,
+  # 10 repeated cycles, spawn failure, cross-task isolation) with witnessed
+  # topology and zero survivors; the process-group-only negative control leaked
+  # detached descendants that production tracking removed; and a real Cargo
+  # workload was cleaned up repeatedly without touching a concurrent Cargo task.
+  # The reported level stays BEST_EFFORT: membership is procd bookkeeping, not a
+  # kernel domain. The documented residual is printed, never counted.
+  macos-native-qualification:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          sw_vers
+          uname -m
+          id
+          cargo --version
+          rustc --version
+      - name: configure + build (warnings are errors)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-Werror"
+          cmake --build build
+      - name: capabilities
+        run: |
+          build/procd capabilities | tee caps.txt
+          grep -qx "ProcessTreeTermination:     BEST_EFFORT" caps.txt
+      - name: shared lifecycle matrix (every scenario must clean up)
+        timeout-minutes: 10
+        run: |
+          PROCD_REQUIRE_CLEANUP=1 build/procd-qualify-test build/procd-adversary | tee macos-lifecycle.log
+          grep -q "PRACTICAL cleanup qualification: PASS" macos-lifecycle.log
+          echo "--- vacuity guard: a workload that never runs must NOT qualify"
+          if PROCD_REQUIRE_CLEANUP=1 build/procd-qualify-test /usr/bin/true; then
+            echo "VACUOUS PASS with /usr/bin/true"; exit 1; fi
+      - name: tracked-domain regressions
+        run: build/procd-macos-tracking-test build/procd-adversary
+      - name: negative control (process groups alone leak detached descendants)
+        run: build/procd-negative-control-test build/procd-adversary
+      - name: real Cargo workload lifecycle
+        run: |
+          mkdir -p cargo-scratch
+          PROCD_REQUIRE_CARGO=1 build/procd-cargo-test tests/cargo_fixture/Cargo.toml cargo-scratch \
+            | tee macos-cargo.log
+      - name: Cargo negative control (process groups alone leak Cargo descendants)
+        run: |
+          if PROCD_NC_WEAKEN=1 PROCD_REQUIRE_CARGO=1 build/procd-cargo-test-nc \
+               tests/cargo_fixture/Cargo.toml cargo-scratch > macos-cargo-nc.log 2>&1; then
+            cat macos-cargo-nc.log; echo "weakened supervision was NOT detected"; exit 1; fi
+          grep -E "recorded task processes remain .*daemon" macos-cargo-nc.log
+      - name: full native suite
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+      - name: publish qualification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-qualification-logs
+          path: macos-*.log
           if-no-files-found: warn
 
   # ENFORCED QUALIFICATION (Linux). The only job whose green means Linux
@@ -107,13 +204,21 @@ jobs:
   # the configuration agentctl normally runs in.
   linux-enforced-qualification:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: ENFORCED qualification in privileged container
         run: |
-          docker run --rm --privileged --cgroupns=private -v "$PWD":/work:ro -w /work gcc:13 \
+          cargo --version
+          docker run --rm --privileged --cgroupns=private -v "$PWD":/work:ro -w /work \
+            -v "${RUSTUP_HOME:-$HOME/.rustup}":/opt/rustup:ro gcc:13 \
             bash -euo pipefail -c '
             apt-get update -qq && apt-get install -y -qq cmake >/dev/null
+            # the runner Rust toolchain, used directly (no rustup proxy)
+            TC=$(ls -d /opt/rustup/toolchains/*-x86_64-unknown-linux-gnu | head -1)
+            export PATH="$TC/bin:$PATH" CARGO_HOME=/tmp/cargo-home
+            mkdir -m 1777 -p $CARGO_HOME
+            cargo --version
             cmake -S . -B /tmp/build -DCMAKE_BUILD_TYPE=Release
             cmake --build /tmp/build
             B=/tmp/build
@@ -134,13 +239,21 @@ jobs:
             if $B/procd qualify --require-enforced /nonexistent/procd-adversary; then
               echo "VACUOUS PASS with a non-executable adversary"; exit 1; fi
 
-            echo "--- qualification (every adversarial scenario must PASS)"
+            echo "--- qualification (every lifecycle scenario must PASS)"
             $B/procd qualify --require-enforced $B/procd-adversary
-            $B/procd-qualify-test $B/procd-adversary
+            PROCD_REQUIRE_CLEANUP=1 $B/procd-qualify-test $B/procd-adversary
             echo "--- negative control (process-group termination leaves detached descendants)"
             $B/procd-negative-control-test $B/procd-adversary
             echo "--- recovery"
             $B/procd-recovery-test
+            echo "--- real Cargo workload"
+            mkdir -p /tmp/cargo-root
+            PROCD_REQUIRE_CARGO=1 $B/procd-cargo-test tests/cargo_fixture/Cargo.toml /tmp/cargo-root
+            echo "--- Cargo negative control (process-group termination leaks Cargo descendants)"
+            if PROCD_NC_WEAKEN=1 PROCD_REQUIRE_CARGO=1 $B/procd-cargo-test-nc \
+                 tests/cargo_fixture/Cargo.toml /tmp/cargo-root > /tmp/cargo-nc.log 2>&1; then
+              cat /tmp/cargo-nc.log; echo "weakened supervision was NOT detected"; exit 1; fi
+            grep -E "recorded task processes remain .*daemon" /tmp/cargo-nc.log
 
             echo "--- full suite: any skipped test fails this job"
             ctest --test-dir $B --output-on-failure --no-tests=error | tee /tmp/ctest.log
@@ -160,6 +273,9 @@ jobs:
             grep -qx "SafeRecovery:               UNSUPPORTED" /tmp/ucaps
             as_user $B/procd qualify --require-enforced $B/procd-adversary
             for t in qualify race identity fd-inherit spawn-fail negative-control; do
-              as_user $B/procd-$t-test $B/procd-adversary
+              as_user env PROCD_REQUIRE_CLEANUP=1 $B/procd-$t-test $B/procd-adversary
             done
+            mkdir -m 0777 /tmp/cargo-user
+            as_user env PROCD_REQUIRE_CARGO=1 $B/procd-cargo-test \
+              tests/cargo_fixture/Cargo.toml /tmp/cargo-user
           '

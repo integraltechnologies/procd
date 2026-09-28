@@ -1,5 +1,5 @@
 /*
- * Adversarial-precondition witnesses (POSIX).
+ * Adversarial-precondition witnesses (POSIX and Windows).
  *
  * Every fixture process records who it is (role, pid, ppid, pgid, sid, process
  * start time) in a per-scenario directory. The harness reads these records and
@@ -8,11 +8,13 @@
  * occurred before termination, and uses (pid, start time) as a survivor oracle
  * afterwards that is immune to PID reuse and never counts zombies as alive.
  *
+ * On Windows the record's start is the process creation FILETIME, ppid is the
+ * creating process, and pgid/sid are 0 (no such topology).
+ *
  * SPDX-License-Identifier: MPL-2.0
  */
 #ifndef PROCD_WITNESS_H
 #define PROCD_WITNESS_H
-#if !defined(_WIN32)
 #include <stddef.h>
 
 #define W_ENV "PROCD_ADV_WITNESS_DIR"
@@ -45,6 +47,8 @@ int w_live(const w_rec *r);
 /* Does the kernel's argv for `pid` contain `arg`? 1/0, or -1 if this platform
  * offers no such view. Used to prove an exec really replaced the image. */
 int w_cmdline_has(long pid, const char *arg);
+/* Hygiene: kill the exact recorded process (pid AND start time) if it is still
+ * running. Never signals a reused pid. */
+void w_kill(const w_rec *r);
 
-#endif
 #endif

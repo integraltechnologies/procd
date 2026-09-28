@@ -98,6 +98,16 @@ target_include_directories(procd-spawn-fail-test PRIVATE include tests)
 add_test(NAME spawn_fail COMMAND procd-spawn-fail-test $<TARGET_FILE:procd-adversary>)
 set_tests_properties(spawn_fail PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
+# Real Cargo workload: procd domain -> shell -> cargo -> rustc / build script /
+# test binary -> descendants, terminated mid-flight (all platforms; needs cargo)
+add_executable(procd-cargo-test tests/cargo_test.c tests/witness.c)
+target_link_libraries(procd-cargo-test PRIVATE procd)
+target_include_directories(procd-cargo-test PRIVATE include tests)
+add_test(NAME cargo_lifecycle
+         COMMAND procd-cargo-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/cargo_fixture/Cargo.toml
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(cargo_lifecycle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
 # TEST-ONLY negative-control library variant: production supervision can never
 # be weakened; only this variant compiles the weakening switch.
 add_library(procd_nc STATIC ${PROCD_SOURCES} src/negative_control.c)
@@ -106,19 +116,14 @@ target_link_libraries(procd_nc PUBLIC Threads::Threads)
 target_compile_definitions(procd_nc PUBLIC PROCD_ENABLE_NEGATIVE_CONTROL)
 
 if(APPLE)
-  add_executable(procd-macos-escape-test tests/macos_escape_test.c)
-  target_link_libraries(procd-macos-escape-test PRIVATE procd)
-  target_include_directories(procd-macos-escape-test PRIVATE include)
-  add_test(NAME macos_escape
-           COMMAND procd-macos-escape-test $<TARGET_FILE:procd-adversary>)
-  set_tests_properties(macos_escape PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-
-  add_executable(procd-macos-pgid-test tests/macos_pgid_test.c tests/witness.c)
-  target_link_libraries(procd-macos-pgid-test PRIVATE procd)
-  target_include_directories(procd-macos-pgid-test PRIVATE include tests)
-  add_test(NAME macos_pgid_safety
-           COMMAND procd-macos-pgid-test $<TARGET_FILE:procd-adversary>)
-  set_tests_properties(macos_pgid_safety PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # Tracked-domain regressions: caller-reaped leader, unrelated same-group
+  # sibling, honest scan-based reporting.
+  add_executable(procd-macos-tracking-test tests/macos_tracking_test.c tests/witness.c)
+  target_link_libraries(procd-macos-tracking-test PRIVATE procd)
+  target_include_directories(procd-macos-tracking-test PRIVATE include tests)
+  add_test(NAME macos_tracking
+           COMMAND procd-macos-tracking-test $<TARGET_FILE:procd-adversary>)
+  set_tests_properties(macos_tracking PROPERTIES TIMEOUT 120)
 endif()
 
 if(WIN32)
@@ -131,6 +136,12 @@ if(WIN32)
            COMMAND procd-windows-qualification-test $<TARGET_FILE:procd-adversary>)
   set_tests_properties(windows_qualification PROPERTIES TIMEOUT 150)
 endif()
+
+# Cargo harness against weakened supervision (PROCD_NC_WEAKEN=1): must FAIL,
+# proving the Cargo oracle sees leaked cargo/build-script/test descendants.
+add_executable(procd-cargo-test-nc tests/cargo_test.c tests/witness.c)
+target_link_libraries(procd-cargo-test-nc PRIVATE procd_nc)
+target_include_directories(procd-cargo-test-nc PRIVATE include tests)
 
 add_executable(procd-negative-control-test tests/negative_control_test.c tests/witness.c)
 target_link_libraries(procd-negative-control-test PRIVATE procd_nc)

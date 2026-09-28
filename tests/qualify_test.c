@@ -18,6 +18,10 @@
  * skip: exit 0 only if ProcessTreeTermination is ENFORCED and every adversarial
  * scenario PASSed with an independently observed precondition; otherwise 1.
  *
+ * With PROCD_REQUIRE_CLEANUP=1 (native per-OS qualification) every lifecycle
+ * scenario must PASS -- witnessed topology, zero survivors, bounded termination
+ * -- whatever capability level the backend reports.
+ *
  * Also verifies an unrelated same-user control process survives qualification.
  *
  * SPDX-License-Identifier: MPL-2.0
@@ -46,8 +50,8 @@ int main(int argc, char **argv) {
     si.cb = sizeof si;
     PROCESS_INFORMATION cpi;
     ZeroMemory(&cpi, sizeof cpi);
-    BOOL have_ctrl = CreateProcessA(NULL, (LPSTR) "cmd /c ping -n 600 127.0.0.1 >NUL", NULL, NULL,
-                                    FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &cpi);
+    BOOL have_ctrl = CreateProcessA(NULL, (LPSTR) "ping.exe -n 600 127.0.0.1", NULL, NULL, FALSE,
+                                    CREATE_NO_WINDOW, NULL, NULL, &si, &cpi);
 #else
     pid_t ctrl = fork();
     if (ctrl == 0) {
@@ -57,12 +61,12 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    q_case cases[32];
+    static q_case cases[Q_MAX_CASES];
     int n = 0;
-    int fails = procd_qualify_run(adv, cases, 32, &n);
+    int fails = procd_qualify_run(adv, cases, Q_MAX_CASES, &n);
     int skips = 0, passes = 0, adv_passes = 0;
     for (int i = 0; i < n; i++) {
-        printf("[%-4s] %-16s %s\n", q_result_name(cases[i].result), cases[i].name, cases[i].detail);
+        printf("[%-4s] %-18s %s\n", q_result_name(cases[i].result), cases[i].name, cases[i].detail);
         if (cases[i].result == Q_SKIP)
             skips++;
         else if (cases[i].result == Q_PASS) {
@@ -96,6 +100,12 @@ int main(int argc, char **argv) {
     printf("==== %d PASS (%d adversarial), %d SKIP, %d FAIL ====\n", passes, adv_passes, skips,
            fails);
     if (fails) return 1;
+    if (procd_qualify_require_cleanup()) {
+        char why[256];
+        int bad = procd_qualify_practical_verdict(cases, n, why, sizeof why);
+        printf("PRACTICAL cleanup qualification: %s: %s\n", bad ? "FAIL" : "PASS", why);
+        if (bad) return 1;
+    }
     if (procd_qualify_strict()) {
         char why[256];
         int bad = procd_qualify_enforced_verdict(cases, n, why, sizeof why);

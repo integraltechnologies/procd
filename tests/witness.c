@@ -193,6 +193,161 @@ int w_live(const w_rec *r) {
 #endif
     return 1;
 }
-#else
-typedef int procd_witness_translation_unit_nonempty;
+
+void w_kill(const w_rec *r) {
+    if (w_alive(r)) kill((pid_t)r->pid, SIGKILL);
+}
+#else /* _WIN32 */
+#include "witness.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windows.h>
+
+#include <tlhelp32.h>
+
+static unsigned long long w_created(HANDLE h) {
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(h, &c, &e, &k, &u)) return 0;
+    return ((unsigned long long)c.dwHighDateTime << 32) | c.dwLowDateTime;
+}
+
+/* Creating process recorded by the kernel (not updated when it exits). */
+static long w_parent(long pid) {
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (s == INVALID_HANDLE_VALUE) return -1;
+    PROCESSENTRY32 e;
+    e.dwSize = sizeof e;
+    long ppid = -1;
+    for (BOOL ok = Process32First(s, &e); ok; ok = Process32Next(s, &e))
+        if ((long)e.th32ProcessID == pid) {
+            ppid = (long)e.th32ParentProcessID;
+            break;
+        }
+    CloseHandle(s);
+    return ppid;
+}
+
+unsigned long long w_start_time(long pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (!h) return 0;
+    unsigned long long st = 0;
+    if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) st = w_created(h);
+    CloseHandle(h);
+    return st;
+}
+
+void w_write(const char *role) {
+    const char *dir = getenv(W_ENV);
+    if (!dir || !dir[0]) return;
+    long pid = (long)GetCurrentProcessId();
+    char tmp[MAX_PATH * 2], fin[MAX_PATH * 2], buf[256];
+    snprintf(tmp, sizeof tmp, "%s\\.%s.%ld.tmp", dir, role, pid);
+    snprintf(fin, sizeof fin, "%s\\%s.%ld", dir, role, pid);
+    int n = snprintf(buf, sizeof buf, "%s %ld %ld 0 0 %llu\n", role, pid, w_parent(pid),
+                     w_created(GetCurrentProcess()));
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    size_t w = fwrite(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (w == (size_t)n)
+        MoveFileExA(tmp, fin, MOVEFILE_REPLACE_EXISTING);
+    else
+        DeleteFileA(tmp);
+}
+
+int w_dir_create(char *out, size_t n) {
+    char base[MAX_PATH];
+    DWORD got = GetTempPathA((DWORD)sizeof base, base);
+    if (!got || got >= (DWORD)sizeof base) return -1;
+    static unsigned seq;
+    for (int i = 0; i < 100; i++) {
+        int w = snprintf(out, n, "%spw%lu_%u", base, (unsigned long)GetCurrentProcessId(), seq++);
+        if (w <= 0 || (size_t)w >= n) return -1;
+        if (CreateDirectoryA(out, NULL)) return 0;
+    }
+    return -1;
+}
+
+void w_dir_remove(const char *dir) {
+    char pat[MAX_PATH * 2];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            char p[MAX_PATH * 2];
+            snprintf(p, sizeof p, "%s\\%s", dir, fd.cFileName);
+            DeleteFileA(p);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(dir);
+}
+
+int w_read(const char *dir, w_rec *out, int max) {
+    char pat[MAX_PATH * 2];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        if (fd.cFileName[0] == '.') continue;
+        char p[MAX_PATH * 2];
+        snprintf(p, sizeof p, "%s\\%s", dir, fd.cFileName);
+        FILE *f = fopen(p, "r");
+        if (!f) continue;
+        w_rec r;
+        memset(&r, 0, sizeof r);
+        if (fscanf(f, "%23s %ld %ld %ld %ld %llu", r.role, &r.pid, &r.ppid, &r.pgid, &r.sid,
+                   &r.start) == 6 &&
+            r.pid > 0 && r.start != 0)
+            out[n++] = r;
+        fclose(f);
+    } while (n < max && FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+const w_rec *w_find(const w_rec *v, int n, const char *role) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(v[i].role, role) == 0) return &v[i];
+    return NULL;
+}
+
+int w_count(const w_rec *v, int n, const char *role) {
+    int c = 0;
+    for (int i = 0; i < n; i++)
+        if (strcmp(v[i].role, role) == 0) c++;
+    return c;
+}
+
+int w_alive(const w_rec *r) {
+    unsigned long long s = w_start_time(r->pid);
+    return s != 0 && s == r->start;
+}
+
+int w_live(const w_rec *r) {
+    return w_alive(r) && w_parent(r->pid) == r->ppid;
+}
+
+int w_cmdline_has(long pid, const char *arg) {
+    (void)pid;
+    (void)arg;
+    return -1;
+}
+
+void w_kill(const w_rec *r) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+                           FALSE, (DWORD)r->pid);
+    if (!h) return;
+    if (w_created(h) == r->start && WaitForSingleObject(h, 0) == WAIT_TIMEOUT) {
+        TerminateProcess(h, 99);
+        WaitForSingleObject(h, 2000);
+    }
+    CloseHandle(h);
+}
 #endif

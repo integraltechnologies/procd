@@ -87,12 +87,12 @@ static int cmd_qualify(const char *argv0, int argc, char **argv) {
     else
         sibling_adversary(argv0, adv, sizeof adv);
 
-    q_case cases[32];
+    static q_case cases[Q_MAX_CASES];
     int n = 0;
-    int fails = procd_qualify_run(adv, cases, 32, &n);
+    int fails = procd_qualify_run(adv, cases, Q_MAX_CASES, &n);
     int pass = 0, skip = 0;
     for (int i = 0; i < n; i++) {
-        printf("[%-4s] %-16s %s\n", q_result_name(cases[i].result), cases[i].name, cases[i].detail);
+        printf("[%-4s] %-18s %s\n", q_result_name(cases[i].result), cases[i].name, cases[i].detail);
         if (cases[i].result == Q_PASS)
             pass++;
         else if (cases[i].result == Q_SKIP)

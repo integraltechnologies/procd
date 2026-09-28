@@ -25,6 +25,8 @@
  *
  *   Linux:   weakened = process-group termination; the workload's descendant
  *            detaches with setsid / a double fork (ordinary topology changes).
+ *   macOS:   weakened = process-group membership only (no domain marker,
+ *            ancestry or remembered generations); same workloads.
  *   Windows: weakened = a Job that permits breakaway.
  *
  * Each phase counts only if the workload's topology was independently witnessed,
@@ -42,7 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 static void set_env(const char *k, const char *v) {
 #if defined(_WIN32)
     _putenv_s(k, v ? v : "");
@@ -55,8 +57,8 @@ static void set_env(const char *k, const char *v) {
 }
 #endif
 
-/* ================= Linux ================= */
-#if defined(__linux__)
+/* ================= Linux / macOS ================= */
+#if defined(__linux__) || defined(__APPLE__)
 #include "witness.h"
 #include <signal.h>
 #include <time.h>
@@ -90,6 +92,9 @@ static int run_phase(int weaken, const char *adv, const char *mode, const char *
     set_env("PROCD_ADV_TTL", "15"); /* NC_TTL_S */
 
     procd_policy pol = PROCD_POLICY_INIT;
+#if defined(__APPLE__)
+    pol.enforcement = PROCD_ALLOW_BEST_EFFORT; /* the tracked backend's real level */
+#endif
     procd_domain *d = NULL;
     if (procd_create_domain(&pol, &d) != PROCD_OK) {
         snprintf(reason, rn, "create failed");
@@ -161,6 +166,7 @@ out:
 
 int main(int argc, char **argv) {
     const char *adv = (argc > 1) ? argv[1] : "procd-adversary";
+#if defined(__linux__)
     procd_capabilities c;
     procd_capabilities_probe(&c);
     if (c.process_tree_termination != PROCD_CAP_ENFORCED) {
@@ -170,6 +176,7 @@ int main(int argc, char **argv) {
                c.detail);
         return strict ? 1 : 77;
     }
+#endif
     static const char *const cases[][2] = {{"setsid", "setsid"}, {"double-fork", "df-grandchild"}};
     int bad = 0;
     for (int i = 0; i < 2; i++) {
@@ -180,7 +187,7 @@ int main(int argc, char **argv) {
                a == 1   ? "SURVIVED (expected)"
                : a == 0 ? "terminated"
                         : "INCONCLUSIVE");
-        printf("cgroup termination       : %s -> %s\n", rb,
+        printf("production termination   : %s -> %s\n", rb,
                b == 0   ? "terminated (expected)"
                : b == 1 ? "SURVIVED!"
                         : "INCONCLUSIVE");
@@ -191,13 +198,14 @@ int main(int argc, char **argv) {
             bad = 1;
         }
         if (b != 0) {
-            printf("FAIL: cgroup termination did not remove the same %s topology\n", cases[i][0]);
+            printf("FAIL: production termination did not remove the same %s topology\n",
+                   cases[i][0]);
             bad = 1;
         }
     }
     if (bad) return 1;
-    printf("PASS: process-group termination leaves detached descendants; the cgroup domain "
-           "removes them\n");
+    printf("PASS: process-group termination leaves detached descendants; the production "
+           "domain removes them\n");
     return 0;
 }
 
@@ -416,7 +424,7 @@ int main(int argc, char **argv) {
 }
 #endif
 
-/* ================= macOS / other ================= */
+/* ================= other ================= */
 #else
 int main(void) {
     /* No backend on this platform claims ENFORCED ProcessTreeTermination, so
