@@ -124,6 +124,49 @@ if(APPLE)
   add_test(NAME macos_tracking
            COMMAND procd-macos-tracking-test $<TARGET_FILE:procd-adversary>)
   set_tests_properties(macos_tracking PROPERTIES TIMEOUT 120)
+
+  # Known residual (env cleared + new session + double fork before any scan):
+  # measured with witnessed topology; escapes reported, casualties fail.
+  add_executable(procd-macos-residual-test tests/macos_residual_test.c tests/witness.c)
+  target_link_libraries(procd-macos-residual-test PRIVATE procd)
+  target_include_directories(procd-macos-residual-test PRIVATE include tests)
+  add_test(NAME macos_residual
+           COMMAND procd-macos-residual-test $<TARGET_FILE:procd-adversary>)
+  set_tests_properties(macos_residual PROPERTIES TIMEOUT 180)
+
+  # Normal-workload soak: shells, Python, Node and real Cargo cancelled at
+  # rotating points; survivors, casualties and isolation failures all fail.
+  # PROCD_SOAK_CYCLES scales it (default 30 in ctest).
+  add_executable(procd-macos-soak-test tests/macos_soak_test.c)
+  target_link_libraries(procd-macos-soak-test PRIVATE procd)
+  target_include_directories(procd-macos-soak-test PRIVATE include)
+  add_test(NAME macos_soak
+           COMMAND procd-macos-soak-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/cargo_fixture/Cargo.toml
+                   ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(macos_soak PROPERTIES TIMEOUT 900)
+
+  # Shared watcher: many live domains, concurrent create/terminate/release,
+  # destroy with fork events pending, no cross-domain membership (production).
+  add_executable(procd-macos-watcher-test tests/macos_watcher_test.c tests/witness.c)
+  target_link_libraries(procd-macos-watcher-test PRIVATE procd)
+  target_include_directories(procd-macos-watcher-test PRIVATE include tests)
+  add_test(NAME macos_watcher
+           COMMAND procd-macos-watcher-test $<TARGET_FILE:procd-adversary> stress)
+  set_tests_properties(macos_watcher PROPERTIES TIMEOUT 300)
+
+  # Status-reap regression with the watcher disabled (test-only knob in the
+  # negative-control library): status must not reap an exited leader before a
+  # scan has attributed its background jobs.
+  add_executable(procd-macos-status-reap-test tests/macos_watcher_test.c tests/witness.c)
+  target_link_libraries(procd-macos-status-reap-test PRIVATE procd_nc)
+  target_include_directories(procd-macos-status-reap-test PRIVATE include tests)
+  add_test(NAME macos_status_reap
+           COMMAND procd-macos-status-reap-test $<TARGET_FILE:procd-adversary> status-reap)
+  set_tests_properties(macos_status_reap PROPERTIES TIMEOUT 120)
+
+  add_executable(procd-macos-cargo-bench tests/macos_cargo_bench.c)
+  target_link_libraries(procd-macos-cargo-bench PRIVATE procd)
+  target_include_directories(procd-macos-cargo-bench PRIVATE include)
 endif()
 
 if(WIN32)

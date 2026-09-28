@@ -14,7 +14,9 @@
  *      setsid, setpgid, double-fork and reparenting to launchd, and tools such
  *      as shells, cargo, rustc, build scripts, test harnesses, Python and Node
  *      pass it on. procd reads each same-user process's exec-time environment
- *      with sysctl KERN_PROCARGS2 (no privilege needed).
+ *      with sysctl KERN_PROCARGS2 (no privilege needed). The kernel hides the
+ *      environment of Apple platform binaries (/bin/sh, /bin/sleep, perl, ...)
+ *      from other processes, so for those only 2-4 apply.
  *   2. Ancestry. Any process whose parent is a member is a member, on every
  *      scan, so a descendant that cleared its environment is still found while
  *      its ancestry reaches the task.
@@ -22,7 +24,21 @@
  *      time), so a member that later clears its environment by exec AND is
  *      reparented is still recognised; pid reuse cannot alias a generation.
  *   4. Process groups. Each spawn leads its own process group; members of that
- *      group are members while the leader's generation still holds the id.
+ *      group are members while the leader's generation still holds the id
+ *      (status reaps an exited leader only after a scan has used its group).
+ *
+ * Reconciliation (a scan applying 1-4 and remembering every member found) runs
+ * on status and terminate, and continuously: a process-wide watcher (one
+ * kqueue, one thread, all domains) registers EVFILT_PROC NOTE_FORK|NOTE_EXEC
+ * on every member it knows of -- including each leader before it runs any
+ * workload code -- and reconciles that domain as soon as a member forks,
+ * posix_spawns (which posts NOTE_FORK) or execs (a fresh image is the moment a
+ * member starts creating its own children; exit events are not used: an
+ * exited member's children are already orphaned).
+ * A new child is therefore usually remembered while its ancestry still links
+ * it to the task, before it can detach, clear its environment or be
+ * reparented. The event carries no child identity; it only triggers the scan.
+ * If the watcher cannot start, status/terminate reconciliation still works.
  *
  * Termination closes admission, then repeatedly scans and SIGSTOPs every member
  * (stopped processes cannot fork, so the set converges even while the task is
@@ -34,9 +50,11 @@
  * Honest level: BEST_EFFORT. Membership is procd bookkeeping, not a kernel
  * domain, so emptiness is a scan (never "proven") and final_state stays
  * UNRESOLVED; a successful terminate (PROCD_OK) means every member procd could
- * find is gone and a final scan found none. Known residual: a descendant that
- * discards its whole environment AND detaches from the tree (setsid + double
- * fork) before any scan observes it; such a process is not found. Crash
+ * find is gone and a final scan found none. Known residual (why this is not
+ * ENFORCED): fork notification is asynchronous and names no child, so a
+ * descendant whose marker is absent or hidden and that detaches (new session,
+ * parent exit / double fork) before the triggered scan completes is not found.
+ * The watcher narrows that window to roughly one scan; it cannot remove it. Crash
  * behavior: nothing kills the task if the supervisor dies (UNRESOLVED), and
  * recovery is not offered.
  *
@@ -59,6 +77,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <pthread.h>
+#include <stdint.h>
+#include <sys/event.h>
+
 extern char **environ;
 
 #define MAC_MAX_LEADERS 64
@@ -74,13 +96,28 @@ typedef struct {
     int n, cap;
 } mac_set;
 
-typedef struct {
+typedef struct mac_impl {
     char marker[64];                  /* "PROCD_DOMAIN_<hex>=1" */
     mac_gen leaders[MAC_MAX_LEADERS]; /* procd's own children, one group each */
     int nleaders;
-    mac_set known;  /* every member generation ever observed */
-    mac_set others; /* generations confirmed NOT to carry the marker */
-    char detail[256];
+    mac_set known;  /* running member generations observed so far */
+    mac_set others; /* running generations confirmed NOT to carry the marker */
+    char detail[384];
+
+    /* Membership state (leaders, known, others, watched, recons, cpu_ns) is
+     * guarded by mu: the domain's own operations and the shared watcher both
+     * reconcile. */
+    pthread_mutex_t mu;
+    mac_set watched; /* members registered with the watcher's kqueue */
+    unsigned long long recons, cpu_ns;
+
+    /* Watcher registry fields, guarded by the watcher lock (W.mu). */
+    uint64_t wid;           /* never-reused id carried by this domain's kevents; 0 = none */
+    struct mac_impl *wnext; /* registry link */
+    int wrefs;              /* watcher reconciliations in flight */
+    int wpending, woff;     /* reconcile requested; no more reconciliations */
+    unsigned long long wevents;
+    int kq; /* the watcher's kqueue while registered, else -1 */
 } mac_impl;
 
 static int gen_eq(const mac_gen *a, const mac_gen *b) {
@@ -118,7 +155,9 @@ static void mac_probe(procd_capabilities *out) {
     out->crash_behavior = PROCD_CRASH_UNRESOLVED_ON_AUTHORITY_LOSS;
     out->detail = "no unprivileged macOS kernel lifecycle domain; members are tracked by an "
                   "inherited per-domain environment marker, ancestry, process generations and "
-                  "process groups, then frozen and killed; emptiness is a scan, not a proof";
+                  "process groups, reconciled continuously on fork events and on status/"
+                  "terminate, then frozen and killed; fork events name no child, so a fast "
+                  "enough detach can still be missed; emptiness is a scan, not a proof";
 }
 
 /* Kernel view of one pid (zombies included). 0 on success. */
@@ -174,7 +213,7 @@ typedef struct {
     mac_gen g;
     pid_t ppid, pgid;
     uid_t uid;
-    int member;
+    int member, other;
 } mac_proc;
 
 /* Snapshot every running process. Caller frees. */
@@ -211,21 +250,27 @@ static mac_proc *snapshot(int *count) {
     return NULL;
 }
 
+static size_t argmax;
+static pthread_once_t argmax_once = PTHREAD_ONCE_INIT;
+static void argmax_init(void) {
+    int mib[2] = {CTL_KERN, KERN_ARGMAX};
+    int am = 0;
+    size_t l = sizeof am;
+    argmax = (sysctl(mib, 2, &am, &l, NULL, 0) == 0 && am > 0) ? (size_t)am : 1 << 20;
+}
+
 /* Find every running member of the domain. Returns count, or -1 if the process
- * table could not be read. Newly observed members are remembered. */
+ * table could not be read. Newly observed members are remembered. Caller holds
+ * im->mu. Remembered generations that are no longer running are forgotten: a
+ * (pid, start time) pair never recurs, so they can never match again, and
+ * continuous reconciliation must not grow the sets without bound. */
 static int scan(mac_impl *im, mac_gen **out) {
     int n = 0;
     mac_proc *p = snapshot(&n);
     if (!p) return -1;
     pid_t self = getpid();
     uid_t me = getuid();
-    static size_t argmax;
-    if (!argmax) {
-        int mib[2] = {CTL_KERN, KERN_ARGMAX};
-        int am = 0;
-        size_t l = sizeof am;
-        argmax = (sysctl(mib, 2, &am, &l, NULL, 0) == 0 && am > 0) ? (size_t)am : 1 << 20;
-    }
+    pthread_once(&argmax_once, argmax_init);
     char *buf = malloc(argmax);
     int weak = procd_nc_weaken_containment(); /* test-only: process groups alone */
 
@@ -241,12 +286,15 @@ static int scan(mac_impl *im, mac_gen **out) {
                 gen_holds(&im->leaders[l]))
                 q->member = 1; /* the leader's generation still holds the group id */
         if (q->member || weak || q->uid != me || !buf) continue;
-        if (set_has(&im->others, &q->g)) continue;
+        if (set_has(&im->others, &q->g)) {
+            q->other = 1;
+            continue;
+        }
         int m = has_marker(q->g.pid, im->marker, buf, argmax);
         if (m == 1)
             q->member = 1;
         else if (m == 0)
-            set_add(&im->others, &q->g); /* exec-time env of a generation never changes */
+            q->other = 1; /* exec-time env of a generation never changes */
     }
     /* ancestry: children of members are members (fixpoint over the snapshot) */
     for (int changed = 1; changed && !weak;) {
@@ -260,12 +308,15 @@ static int scan(mac_impl *im, mac_gen **out) {
                 }
         }
     }
+    /* both sets now hold exactly the running generations they describe */
+    im->known.n = im->others.n = 0;
     int m = 0;
     for (int i = 0; i < n; i++)
         if (p[i].member) {
             if (!weak) set_add(&im->known, &p[i].g);
             p[m++].g = p[i].g;
-        }
+        } else if (p[i].other)
+            set_add(&im->others, &p[i].g);
     mac_gen *res = NULL;
     if (out && m) {
         res = malloc((size_t)m * sizeof *res);
@@ -291,6 +342,226 @@ static void mac_reap(mac_impl *im) {
     }
 }
 
+/* ---------------- shared event-assisted watcher ----------------
+ *
+ * One process-wide kqueue and one thread serve every macOS domain; they start
+ * with the first domain and live for the rest of the process.
+ *
+ * Locking (two locks, never nested):
+ *   W.mu   guards the registry: the domain list, each domain's wid, wrefs,
+ *          wpending, woff and wevents, and the watcher's own state. It is held
+ *          only for list/flag updates -- never across a scan, a kevent call or
+ *          while any im->mu is held.
+ *   im->mu guards one domain's membership state. The domain's status,
+ *          terminate and spawn take it around their reconciliation; the
+ *          watcher takes it only while it holds a registry reference.
+ * Lifetime: the watcher only reaches a domain through the registry, and takes
+ * a reference (wrefs) under W.mu before releasing W.mu. mac_destroy unlinks the
+ * domain under W.mu and waits (W.idle) until wrefs is 0, so the watcher never
+ * touches freed memory. kevents carry the domain's never-reused 64-bit wid, not
+ * a pointer: a stale event (member of a destroyed domain, or of a domain that
+ * has begun terminating) finds nothing and is dropped.
+ * Contamination: an event only marks the domain named by its wid for
+ * reconciliation; membership is decided by that domain's own evidence in
+ * scan(). A misdirected event can cost a scan, never add a member.
+ * Failure: if the kqueue or thread cannot be created (or the thread's kevent
+ * fails), domains simply are not watched; status/terminate reconciliation is
+ * unchanged. The termination detail says which applied.
+ * fork(): the child does not inherit the thread or the kqueue; an atfork
+ * handler takes W.mu across fork and resets the watcher in the child. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t idle; /* broadcast when a domain's wrefs drops to 0 */
+    int kq;              /* valid while state == 1 */
+    int state;           /* 0 not started, 1 running, -1 unavailable */
+    uint64_t next_id;
+    mac_impl *head;
+} W = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, -1, 0, 1, NULL};
+
+static void w_prepare(void) {
+    pthread_mutex_lock(&W.mu);
+}
+static void w_parent(void) {
+    pthread_mutex_unlock(&W.mu);
+}
+static void w_child(void) {
+    static const pthread_mutex_t m0 = PTHREAD_MUTEX_INITIALIZER;
+    static const pthread_cond_t c0 = PTHREAD_COND_INITIALIZER;
+    W.mu = m0; /* plain stores: no watcher thread exists in the child */
+    W.idle = c0;
+    W.kq = -1;
+    W.state = 0;
+    W.head = NULL;
+}
+static pthread_once_t w_atfork_once = PTHREAD_ONCE_INIT;
+static void w_atfork(void) {
+    pthread_atfork(w_prepare, w_parent, w_child);
+}
+
+static unsigned long long thread_cpu_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+}
+
+/* Register every running member not yet watched and forget watches of
+ * generations no longer among the members. Caller holds im->mu. */
+static void track(mac_impl *im, const mac_gen *m, int n) {
+    if (im->kq < 0 || n < 0) return;
+    int keep = 0;
+    for (int i = 0; i < im->watched.n; i++)
+        for (int j = 0; j < n; j++)
+            if (gen_eq(&im->watched.v[i], &m[j])) {
+                im->watched.v[keep++] = im->watched.v[i];
+                break;
+            }
+    im->watched.n = keep;
+    for (int i = 0; i < n; i++) {
+        if (set_has(&im->watched, &m[i])) continue;
+        struct kevent ev;
+        EV_SET(&ev, (uintptr_t)m[i].pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_FORK | NOTE_EXEC, 0,
+               (void *)(uintptr_t)im->wid);
+        /* ESRCH: already gone. A reused pid is harmless: the event only
+         * triggers a reconciliation that re-derives membership. */
+        if (kevent(im->kq, &ev, 1, NULL, 0, NULL) == 0) set_add(&im->watched, &m[i]);
+    }
+}
+
+/* One reconciliation on behalf of the watcher (caller holds a reference). */
+static void reconcile(mac_impl *im) {
+    unsigned long long c0 = thread_cpu_ns();
+    pthread_mutex_lock(&im->mu);
+    mac_gen *m = NULL;
+    int n = scan(im, &m);
+    track(im, m, n);
+    im->recons++;
+    im->cpu_ns += thread_cpu_ns() - c0;
+    pthread_mutex_unlock(&im->mu);
+    free(m);
+}
+
+static void *watch_main(void *arg) {
+    int kq = (int)(intptr_t)arg;
+    struct kevent ev[128];
+    for (;;) {
+        int n = kevent(kq, NULL, 0, ev, 128, NULL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) break;
+        /* coalesce: every queued event marks its domain; each marked domain
+         * is then reconciled once, however many of its members forked */
+        pthread_mutex_lock(&W.mu);
+        for (int i = 0; i < n; i++) {
+            uint64_t id = (uint64_t)(uintptr_t)ev[i].udata;
+            for (mac_impl *d = W.head; d; d = d->wnext)
+                if (d->wid == id) {
+                    d->wevents++;
+                    d->wpending = 1;
+                    break;
+                }
+        }
+        pthread_mutex_unlock(&W.mu);
+        for (;;) {
+            mac_impl *im = NULL;
+            pthread_mutex_lock(&W.mu);
+            for (mac_impl *d = W.head; d && !im; d = d->wnext)
+                if (d->wpending && !d->woff) {
+                    d->wpending = 0;
+                    d->wrefs++;
+                    im = d;
+                }
+            pthread_mutex_unlock(&W.mu);
+            if (!im) break;
+            reconcile(im);
+            pthread_mutex_lock(&W.mu);
+            if (--im->wrefs == 0) pthread_cond_broadcast(&W.idle);
+            pthread_mutex_unlock(&W.mu);
+        }
+    }
+    pthread_mutex_lock(&W.mu); /* degrade to reconciliation-only supervision */
+    W.state = -1;
+    for (mac_impl *d = W.head; d; d = d->wnext)
+        d->wpending = 0;
+    pthread_mutex_unlock(&W.mu);
+    return NULL;
+}
+
+/* TEST-ONLY (negative-control library variant, never production): with
+ * PROCD_NC_NO_WATCH=1 a new domain does not join the watcher, so tests can
+ * exercise reconciliation-only supervision (the fallback when the watcher is
+ * unavailable) and regressions the watcher would otherwise mask. */
+static int watch_disabled_for_test(void) {
+#ifdef PROCD_ENABLE_NEGATIVE_CONTROL
+    const char *v = getenv("PROCD_NC_NO_WATCH");
+    return v && strcmp(v, "1") == 0;
+#else
+    return 0;
+#endif
+}
+
+/* Join the shared watcher (starting it on first use). Never fails the domain. */
+static void watch_register(mac_impl *im) {
+    pthread_once(&w_atfork_once, w_atfork);
+    im->kq = -1;
+    if (watch_disabled_for_test()) return;
+    pthread_mutex_lock(&W.mu);
+    if (W.state == 0) {
+        W.state = -1;
+        int kq = kqueue();
+        pthread_attr_t a;
+        pthread_t th;
+        if (kq >= 0 && pthread_attr_init(&a) == 0) {
+            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&th, &a, watch_main, (void *)(intptr_t)kq) == 0) {
+                W.kq = kq;
+                W.state = 1;
+            }
+            pthread_attr_destroy(&a);
+        }
+        if (W.state != 1 && kq >= 0) close(kq);
+    }
+    if (W.state == 1) {
+        im->wid = W.next_id++;
+        im->kq = W.kq;
+        im->wnext = W.head;
+        W.head = im;
+    }
+    pthread_mutex_unlock(&W.mu);
+}
+
+/* Stop watcher reconciliations of this domain; with `unlink`, also leave the
+ * registry and wait until no watcher reconciliation is using it. */
+static void watch_quiesce(mac_impl *im, int unlink) {
+    pthread_mutex_lock(&W.mu);
+    im->woff = 1;
+    im->wpending = 0;
+    if (unlink) {
+        for (mac_impl **pp = &W.head; *pp; pp = &(*pp)->wnext)
+            if (*pp == im) {
+                *pp = im->wnext;
+                break;
+            }
+        while (im->wrefs > 0)
+            pthread_cond_wait(&W.idle, &W.mu);
+    }
+    pthread_mutex_unlock(&W.mu);
+}
+
+/* "; ..." suffix for the termination detail */
+static void watch_describe(mac_impl *im, char *buf, size_t n) {
+    pthread_mutex_lock(&W.mu);
+    unsigned long long ev = im->wevents;
+    int state = W.state, reg = im->wid != 0;
+    pthread_mutex_unlock(&W.mu);
+    if (reg && state == 1)
+        snprintf(buf, n,
+                 "; event-assisted tracking: %llu fork/exec events, %llu reconciliations, %.1fms",
+                 ev, im->recons, (double)im->cpu_ns / 1e6);
+    else
+        snprintf(buf, n,
+                 "; event-assisted tracking unavailable (reconciliation on status/"
+                 "terminate only)");
+}
+
 static procd_status mac_create(procd_domain *d) {
     if (d->policy.enforcement == PROCD_REQUIRE_ENFORCED)
         return PROCD_E_UNSUPPORTED_ENFORCEMENT; /* fail closed; never fake it */
@@ -302,6 +573,11 @@ static procd_status mac_create(procd_domain *d) {
     for (size_t i = 0; i < sizeof nonce; i++)
         w += snprintf(im->marker + w, sizeof im->marker - (size_t)w, "%02x", nonce[i]);
     snprintf(im->marker + w, sizeof im->marker - (size_t)w, "=1");
+    if (pthread_mutex_init(&im->mu, NULL) != 0) {
+        free(im);
+        return PROCD_E_INTERNAL;
+    }
+    watch_register(im);
     d->impl = im;
     d->runtime_level = PROCD_CAP_BEST_EFFORT;
     d->state = PROCD_STATE_CREATED;
@@ -376,8 +652,11 @@ static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t 
         waitpid(pid, NULL, 0);
         return PROCD_E_INTERNAL;
     }
+    pthread_mutex_lock(&im->mu);
     im->leaders[im->nleaders++] = g;
     set_add(&im->known, &g);
+    track(im, &g, 1); /* before the workload runs: every fork of the leader is seen */
+    pthread_mutex_unlock(&im->mu);
     ssize_t wr = write(go[1], &b, 1);
     close(go[1]);
     int err = 0;
@@ -390,7 +669,9 @@ static procd_status mac_spawn(procd_domain *d, const char *const *argv, int64_t 
         /* exec failed (or the go signal was lost): only this child is affected;
          * everything else in the domain keeps running */
         waitpid(pid, NULL, 0);
+        pthread_mutex_lock(&im->mu);
         im->nleaders--;
+        pthread_mutex_unlock(&im->mu);
         return (r == (ssize_t)sizeof err && (err == ENOENT || err == ENOTDIR)) ? PROCD_E_NOT_FOUND
                : (r == (ssize_t)sizeof err && err == EACCES)                   ? PROCD_E_PERMISSION
                                                                                : PROCD_E_IO;
@@ -404,8 +685,27 @@ static procd_status mac_status(procd_domain *d, procd_domain_status *out) {
     mac_impl *im = d->impl;
     out->process_tree_termination = d->runtime_level;
     out->population_is_authoritative = 0; /* a scan cannot prove emptiness */
-    mac_reap(im);
-    int live = scan(im, NULL);
+    /* Reap only leaders that were already exited when this scan began: an
+     * unreaped exited leader still holds its process-group id, so the scan
+     * attributes (and remembers) group members whose parent has exited and
+     * whose environment the kernel hides (Apple platform binaries such as
+     * /bin/sleep). A leader that exits during the scan is reaped next time. */
+    pthread_mutex_lock(&im->mu);
+    int exited[MAC_MAX_LEADERS];
+    for (int i = 0; i < im->nleaders; i++) {
+        mac_gen now;
+        int z = 0;
+        exited[i] = im->leaders[i].pid > 0 && kproc(im->leaders[i].pid, &now, &z) == 0 && z &&
+                    gen_eq(&now, &im->leaders[i]);
+    }
+    mac_gen *m = NULL;
+    int live = scan(im, &m);
+    track(im, m, live);
+    for (int i = 0; i < im->nleaders; i++)
+        if (exited[i] && waitpid(im->leaders[i].pid, NULL, WNOHANG) == im->leaders[i].pid)
+            im->leaders[i].pid = 0;
+    pthread_mutex_unlock(&im->mu);
+    free(m);
     out->population = live < 0 ? PROCD_POP_UNKNOWN : live ? PROCD_POP_POPULATED : PROCD_POP_EMPTY;
     out->state = d->state;
     return PROCD_OK;
@@ -427,6 +727,10 @@ static procd_status mac_terminate(procd_domain *d, int timeout_ms,
     mac_impl *im = d->impl;
     out->detail = im->detail;
     d->state = PROCD_STATE_TERMINATING;
+    /* teardown runs its own freeze/kill loop; the watcher stops helping, and
+     * each step below holds im->mu only for its scan so a watcher
+     * reconciliation already in flight never waits out the whole teardown */
+    watch_quiesce(im, 0);
     out->admission_closed = 1;   /* procd admits nothing more; members are frozen */
     out->authority_directed = 0; /* signals target discovered members, not a kernel domain */
     if (timeout_ms <= 0) timeout_ms = 5000;
@@ -437,7 +741,9 @@ static procd_status mac_terminate(procd_domain *d, int timeout_ms,
     int rounds = 0, unreadable = 0;
     for (;; rounds++) {
         mac_gen *m = NULL;
+        pthread_mutex_lock(&im->mu);
         int n = scan(im, &m);
+        pthread_mutex_unlock(&im->mu);
         if (n < 0) {
             unreadable = 1;
             break;
@@ -457,9 +763,11 @@ static procd_status mac_terminate(procd_domain *d, int timeout_ms,
     /* 3. rescan and kill until nothing runs */
     int remaining = -1;
     for (;;) {
-        mac_reap(im);
         mac_gen *m = NULL;
+        pthread_mutex_lock(&im->mu);
+        mac_reap(im);
         int n = scan(im, &m);
+        pthread_mutex_unlock(&im->mu);
         if (n >= 0) remaining = n;
         for (int i = 0; i < n; i++)
             gen_signal(&m[i], SIGKILL);
@@ -467,8 +775,12 @@ static procd_status mac_terminate(procd_domain *d, int timeout_ms,
         if (n == 0 || now_ms() > deadline) break;
         nap(5);
     }
+    pthread_mutex_lock(&im->mu);
     mac_reap(im);
+    pthread_mutex_unlock(&im->mu);
     int killed = stopped.n;
+    char wd[160];
+    watch_describe(im, wd, sizeof wd);
     free(stopped.v);
 
     /* a scan is not proof: never EMPTY, never proven */
@@ -477,19 +789,19 @@ static procd_status mac_terminate(procd_domain *d, int timeout_ms,
     out->final_state = PROCD_STATE_UNRESOLVED;
     d->state = PROCD_STATE_UNRESOLVED;
     if (unreadable || remaining < 0) {
-        snprintf(im->detail, sizeof im->detail, "process table unreadable; outcome unknown");
+        snprintf(im->detail, sizeof im->detail, "process table unreadable; outcome unknown%s", wd);
         return PROCD_E_IO;
     }
     if (remaining > 0) {
         snprintf(im->detail, sizeof im->detail,
-                 "timed out: %d tracked member(s) still running after %d freeze round(s)",
-                 remaining, rounds + 1);
+                 "timed out: %d tracked member(s) still running after %d freeze round(s)%s",
+                 remaining, rounds + 1, wd);
         return PROCD_E_TIMEOUT;
     }
     snprintf(im->detail, sizeof im->detail,
              "froze and killed %d tracked member(s) in %d round(s); final scan found none "
-             "(scan-based, not a kernel emptiness proof)",
-             killed, rounds + 1);
+             "(scan-based, not a kernel emptiness proof)%s",
+             killed, rounds + 1, wd);
     return PROCD_OK;
 }
 
@@ -502,6 +814,16 @@ static procd_status mac_identity(procd_domain *d, char *buf, size_t n) {
 static void mac_destroy(procd_domain *d) {
     mac_impl *im = d->impl;
     if (im) {
+        watch_quiesce(im, 1); /* after this the watcher cannot reach im */
+        /* drop this domain's remaining watches (members still running) */
+        for (int i = 0; im->kq >= 0 && i < im->watched.n; i++)
+            if (gen_running(&im->watched.v[i])) {
+                struct kevent ev;
+                EV_SET(&ev, (uintptr_t)im->watched.v[i].pid, EVFILT_PROC, EV_DELETE, 0, 0, NULL);
+                kevent(im->kq, &ev, 1, NULL, 0, NULL);
+            }
+        free(im->watched.v);
+        pthread_mutex_destroy(&im->mu);
         mac_reap(im);
         free(im->known.v);
         free(im->others.v);

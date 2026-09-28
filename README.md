@@ -60,7 +60,7 @@ capability discovery.
 |----------|-----------|--------------------------|-------|
 | **Linux** | cgroup v2 child of procd's own cgroup, `cgroup.kill`, `cgroup.events` | **ENFORCED** (cgroup v2 + `cgroup.kill` + a writable own cgroup: root, or an ordinary user with a delegated subtree) | Workload admitted to the cgroup and verified before exec; it runs with the caller's credentials (optional explicit run-as uid/gid). Termination writes `cgroup.kill`; emptiness via `cgroup.events` `populated 0`. Recovery (root only) trusts a root-owned record in `/var/lib/procd` (boot id, cgroup view, path, inode, level), so a stale or edited identity yields `UNRESOLVED` rather than redirecting termination. Without a usable cgroup-v2 domain nothing is created (no Linux fallback). |
 | **Windows** | unnamed Job Object per domain, `KILL_ON_JOB_CLOSE`, no breakaway | **ENFORCED** | Suspended-create → assign-to-Job → verify → resume. Every ordinary descendant stays in the Job whatever its creation flags (`DETACHED_PROCESS`, new process group, `start /b`, parent exit, nested Jobs such as cargo's); a `CREATE_BREAKAWAY_FROM_JOB` request is refused. Termination closes admission (active-process limit), repeats `TerminateJobObject` until the kernel's `ActiveProcesses` is 0 (proven emptiness), and supervisor exit kills the Job. Out of contract, reproduced natively and reported separately: `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` with a handle to an outside process, duplicating the supervisor's Job handle, and WMI/Task Scheduler/SCM brokers. Recovery: `UNSUPPORTED`. |
-| **macOS** | tracked domain: inherited per-domain environment marker + ancestry + remembered (pid, start time) generations + process groups; freeze (`SIGSTOP`) then kill | **BEST_EFFORT** | No unprivileged kernel lifecycle domain exists (process groups are left by `setsid`/`setpgid`/double fork, `NOTE_TRACK` is `ENOTSUP`, coalitions need entitlements). procd tracks members itself: the marker is inherited through fork/exec/`setsid`/double fork/reparenting and passed on by shells, cargo, rustc, build scripts and test harnesses, and is read from each same-user process's exec-time environment (`KERN_PROCARGS2`); descendants that clear their environment are still found through ancestry and remembered generations. Termination SIGSTOPs members until the set converges (stopped processes cannot fork), SIGKILLs them, and rescans until none runs; every signal re-confirms the target's generation, so unrelated processes are never signalled. Natively qualified on every ordinary topology and the Cargo workload. Emptiness is a scan, so it is never reported as proven (final state `UNRESOLVED`, `PROCD_OK` = none found). Residual: a descendant that discards its whole environment **and** detaches (new session + double fork) before procd observes it. No crash cleanup or recovery: if the supervisor dies the task keeps running. |
+| **macOS** | tracked domain: inherited per-domain environment marker + ancestry + remembered (pid, start time) generations + process groups, reconciled continuously by a shared fork/exec watcher (`kqueue` `EVFILT_PROC`) and on status/terminate; freeze (`SIGSTOP`) then kill | **BEST_EFFORT** | No unprivileged kernel lifecycle domain exists (process groups are left by `setsid`/`setpgid`/double fork, `NOTE_TRACK` is `ENOTSUP`, coalitions need entitlements). procd tracks members itself. The marker is inherited through fork/exec/`setsid`/double fork/reparenting and passed on by shells, cargo, rustc, build scripts, test harnesses, Python and Node, and is read from each same-user process's exec-time environment (`KERN_PROCARGS2`); the kernel hides that environment for Apple platform binaries (`/bin/sh`, `/bin/sleep`, `perl`, ...), so membership never relies on the marker alone: children of members are members, and every member found is remembered by (pid, start time), so a later `setsid`, environment change or reparenting does not erase it. One process-wide watcher thread (one `kqueue`, all domains) is notified whenever a known member forks, `posix_spawn`s or execs, and reconciles that domain at once, so new children -- including detached helpers such as Python `start_new_session=True` / Node `detached: true` running `/bin/sleep` whose parent then exits -- are normally remembered while their ancestry still links them to the task. Termination SIGSTOPs members until the set converges (stopped processes cannot fork), SIGKILLs them, and rescans until none runs; every signal re-confirms the target's generation, so unrelated processes are never signalled. Natively qualified on every ordinary topology, a 1,000-cycle normal-workload soak (shells, Python, Node, Cargo, detached helpers) and the Cargo workload. Emptiness is a scan, so it is never reported as proven (final state `UNRESOLVED`, `PROCD_OK` = none found). Why not ENFORCED: fork notification is asynchronous and names no child, so a descendant with no visible marker that detaches (new session + parent exit / double fork) faster than the triggered reconciliation is still missed; the watcher narrows that window, it cannot close it. No crash cleanup or recovery: if the supervisor dies the task keeps running. |
 
 ### Using procd from agentctl
 
@@ -72,8 +72,9 @@ capability discovery.
   kills the task. A restarted agentctl on those platforms has no handle to the
   old task, so run agentctl itself under a service manager that stops its
   process tree (systemd unit / launchd job), or avoid unclean supervisor exits.
-- macOS: do not rely on procd for a task that deliberately runs `env -i` and
-  then daemonizes; ordinary tools keep the environment and are covered.
+- macOS: ordinary tools, including detached helpers whose parent exits, are
+  covered; do not rely on procd for a task that deliberately clears its
+  environment and daemonizes within microseconds (see the residual below).
 
 ## Build
 
@@ -149,6 +150,31 @@ procd run [--require-enforced] -- <cmd> [args...]
   reaped by the embedding caller still has its orphan cleaned up; an unrelated
   process sharing procd's own process group and session is never signalled;
   scan-based results are never reported as proven.
+- **macOS normal-workload soak**
+  ([`tests/macos_soak_test.c`](tests/macos_soak_test.c)) — the reliability
+  measurement: sh/bash pipelines, background jobs, nested shells, `xargs -P`,
+  a spawn loop, Python `subprocess`/`multiprocessing`, Node `child_process`,
+  detached Python/Node helpers running Apple platform binaries whose parent
+  exits, and real Cargo (rustc, build script, test binary, `cargo check`),
+  cancelled at rotating points with agentctl-like status polling, plus
+  concurrent-domain isolation runs and an unrelated control process. The
+  oracle is independent of procd (a harness-only environment tag plus
+  witnessed (pid, start time) identities). Any survivor fails.
+  `PROCD_SOAK_CYCLES` scales it.
+- **macOS shared watcher**
+  ([`tests/macos_watcher_test.c`](tests/macos_watcher_test.c)) — 16 live
+  domains terminated one at a time with no cross-domain effect, concurrent
+  create/terminate/release on 6 threads (including release while fork events
+  are pending), rapid create/destroy; and, with the watcher disabled in the
+  test library, the regression that `status` never reaps an exited leader
+  before a scan has attributed its background jobs.
+- **macOS residual boundary** (adversarial, not a failure rate)
+  ([`tests/macos_residual_test.c`](tests/macos_residual_test.c)) — a
+  purpose-built storm of env-cleared new-session double forks, raced against
+  termination. It measures how much of the known observation race remains;
+  escapes are reported, never failed, and are not representative of ordinary
+  workloads. [`tests/macos_cargo_bench.c`](tests/macos_cargo_bench.c) measures
+  watcher cost and cancellation on a real Cargo build.
 - **Windows mechanism qualification**
   ([`tests/windows_qualification_test.c`](tests/windows_qualification_test.c)) —
   suspended pre-exec admission, Job-handle non-inheritance, unrelated-process
