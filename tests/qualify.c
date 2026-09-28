@@ -246,8 +246,8 @@ static int precondition(const char *mode, long spawned, const w_rec *w, int n, c
         NEED(!w_alive(r) && w_live(o), "leader not exited / descendant not running as witnessed");
     } else if (!strcmp(mode, "background")) {
         const w_rec *b = w_find(w, n, "bg");
-        NEED(b && b->pid != r->pid && b->ppid != r->pid,
-             "shell background job (parent != root) not witnessed");
+        NEED(b, "shell background job not witnessed");
+        NEED(b->pid != r->pid && b->ppid != r->pid, "background job still parented by the shell");
 #if defined(_WIN32)
         NEED(w_live(b) && w_live(r), "background job / root not running as witnessed");
 #else
@@ -389,7 +389,7 @@ static void run_start(run *x, const char *adv, const char *mode) {
     }
     static w_rec w[W_MAX];
     /* wall-clock bound: macOS timer coalescing can stretch short sleeps */
-    for (long long end = mono_ms() + 6000; !x->pre && mono_ms() < end;) {
+    for (long long end = mono_ms() + 10000; !x->pre && mono_ms() < end;) {
         nap_ms(20);
         int n = w_read(x->wd, w, W_MAX);
         x->pre = precondition(mode, (long)x->pid, w, n, x->why, sizeof x->why);

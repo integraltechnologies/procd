@@ -359,9 +359,11 @@ static void nap_ms(int ms) {
     struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000};
     nanosleep(&t, NULL);
 }
-/* bounded wait until our parent is no longer `orig` (we were reparented) */
+/* bounded (wall-clock, not iterations: macOS coalesces short sleeps) wait
+ * until our parent is no longer `orig` (we were reparented) */
 static void await_reparent(pid_t orig) {
-    for (int i = 0; i < 400 && getppid() == orig; i++)
+    time_t end = time(NULL) + 5;
+    while (getppid() == orig && time(NULL) <= end)
         nap_ms(5);
 }
 /* witness `role`, then live out the bounded lifetime */
